@@ -26,7 +26,7 @@ async def process_files(
     ship_df = pd.read_excel(ship_file.file)
 
     # Step 2: Calculate total from "Total général"
-    total_to_remove = ship_df["Total général"].sum()
+    total_to_remove = ship_df["Total general"].sum()
 
     # Step 3: Apply downcounting to PAG Integration
     qty_to_remove = total_to_remove
