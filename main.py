@@ -46,13 +46,13 @@ async def process_files(
                 pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                 qty_to_remove = 0
 
-    # Step 4: Return updated Excel with proper date formatting
+    # Step 4: Convert datetime columns to MM/DD/YYYY strings
+    for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
+        pag_df[col] = pag_df[col].dt.strftime("%m/%d/%Y")
+
+    # Step 5: Return updated Excel
     output = io.BytesIO()
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl",
-        date_format="MM/DD/YYYY"  # 👈 ensures Excel displays dates like 10/10/2025
-    ) as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
     output.seek(0)
 
@@ -63,7 +63,7 @@ async def process_files(
     )
 
 
-# Optional root endpoint for testing
+# Optional root endpoint for quick check
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
