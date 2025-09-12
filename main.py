@@ -6,15 +6,14 @@ import io
 
 app = FastAPI()
 
-# CORS - allow your frontend (adjust if needed)
+# Allow your frontend (Vercel)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
+    allow_origins=["https://pag-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.post("/process")
 async def process_files(
@@ -25,31 +24,26 @@ async def process_files(
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Step 2: Group Shipment vs Receipt by PO Number + P/N
-    # Match keys: PO Number <-> Purchasing Document, (a)P/N&S/N <-> Material
+    # Step 2: Group Shipment vs Receipt by P/N only and sum Total général
     grouped_ship = (
-        ship_df.groupby(["PO Number", "(a)P/N&S/N"])["Total général"]
+        ship_df.groupby("(a)P/N&S/N")["Total général"]
         .sum()
         .reset_index()
     )
 
-    # Step 3: Downcount in PAG Integration per (PO Number, Material)
+    # Step 3: Downcount PAG Integration by Material only
     for _, row in grouped_ship.iterrows():
-        po_number = row["PO Number"]
         material = row["(a)P/N&S/N"]
         qty_to_remove = row["Total général"]
 
-        # Filter matching rows in PAG Integration
-        matching_rows = pag_df[
-            (pag_df["Purchasing Document"] == po_number) &
-            (pag_df["Material"] == material)
-        ]
+        # Find matching rows in PAG Integration
+        matching_rows = pag_df[pag_df["Material"] == material]
 
         for idx, pag_row in matching_rows.iterrows():
             if qty_to_remove <= 0:
                 break
-            if pag_row["Qty remaining to deliver"] > 0:
-                available = pag_row["Qty remaining to deliver"]
+            available = pag_row["Qty remaining to deliver"]
+            if available > 0:
                 if available <= qty_to_remove:
                     pag_df.at[idx, "Qty remaining to deliver"] = 0
                     qty_to_remove -= available
@@ -73,8 +67,6 @@ async def process_files(
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
 
-
-# Optional root endpoint
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
