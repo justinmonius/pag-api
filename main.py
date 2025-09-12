@@ -4,12 +4,12 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 
-app = FastAPI() #testttttt
+app = FastAPI()
 
-# CORS - allow your frontend GitHub Pages URL
+# CORS - allow your frontend (adjust if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],  # your GitHub Pages frontend
+    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,17 +21,17 @@ async def process_files(
     pag_file: UploadFile = File(...),
     ship_file: UploadFile = File(...)
 ):
-    # Read Excel files
+    # Step 1: Read Excel files
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Step 1: Calculate total unbooked shipped MRAS
+    # Step 2: Calculate total unbooked shipped MRAS
     unbooked = ship_df[
         (ship_df["Booked SNA"].isna()) | (ship_df["Booked SNA"] == 0)
     ]
-    total_unbooked = -unbooked["Shipped MRAS"].sum()  # make it positive
+    total_unbooked = -unbooked["Shipped MRAS"].sum()  # make positive
 
-    # Step 2: Apply downcounting
+    # Step 3: Apply downcounting to PAG Integration
     qty_to_remove = total_unbooked
 
     for idx, row in pag_df.iterrows():
@@ -46,9 +46,13 @@ async def process_files(
                 pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                 qty_to_remove = 0
 
-    # Step 3: Return updated Excel
+    # Step 4: Return updated Excel with proper date formatting
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl",
+        date_format="MM/DD/YYYY"  # 👈 ensures Excel displays dates like 10/10/2025
+    ) as writer:
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
     output.seek(0)
 
@@ -57,3 +61,9 @@ async def process_files(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
+
+
+# Optional root endpoint for testing
+@app.get("/")
+def root():
+    return {"message": "PAG API is live!"}
