@@ -6,14 +6,15 @@ import io
 
 app = FastAPI()
 
-# Allow your frontend (Vercel)
+# CORS - allow your frontend (adjust if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],
+    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.post("/process")
 async def process_files(
@@ -24,32 +25,23 @@ async def process_files(
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Step 2: Group Shipment vs Receipt by P/N only and sum Total général
-    grouped_ship = (
-        ship_df.groupby("(a)P/N&S/N")["Total général"]
-        .sum()
-        .reset_index()
-    )
+    # Step 2: Calculate total from "Total général"
+    total_to_remove = ship_df["Total général"].sum()
 
-    # Step 3: Downcount PAG Integration by Material only
-    for _, row in grouped_ship.iterrows():
-        material = row["(a)P/N&S/N"]
-        qty_to_remove = row["Total général"]
+    # Step 3: Apply downcounting to PAG Integration
+    qty_to_remove = total_to_remove
 
-        # Find matching rows in PAG Integration
-        matching_rows = pag_df[pag_df["Material"] == material]
-
-        for idx, pag_row in matching_rows.iterrows():
-            if qty_to_remove <= 0:
-                break
-            available = pag_row["Qty remaining to deliver"]
-            if available > 0:
-                if available <= qty_to_remove:
-                    pag_df.at[idx, "Qty remaining to deliver"] = 0
-                    qty_to_remove -= available
-                else:
-                    pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
-                    qty_to_remove = 0
+    for idx, row in pag_df.iterrows():
+        if qty_to_remove <= 0:
+            break
+        if row["Qty remaining to deliver"] > 0:
+            available = row["Qty remaining to deliver"]
+            if available <= qty_to_remove:
+                pag_df.at[idx, "Qty remaining to deliver"] = 0
+                qty_to_remove -= available
+            else:
+                pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                qty_to_remove = 0
 
     # Step 4: Convert datetime columns to MM/DD/YYYY strings
     for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
@@ -67,6 +59,8 @@ async def process_files(
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
 
+
+# Optional root endpoint for quick check
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
