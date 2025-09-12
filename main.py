@@ -6,10 +6,10 @@ import io
 
 app = FastAPI()
 
-# CORS so your frontend can talk to the backend
+# CORS - allow your frontend GitHub Pages URL
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to your frontend domain later
+    allow_origins=["https://pag-frontend.vercel.app"],  # your GitHub Pages frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,14 +25,13 @@ async def process_files(
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # --- Step 1: Calculate total unbooked shipped ---
-    # Filter rows where Booked SNA is missing or 0
+    # Step 1: Calculate total unbooked shipped MRAS
     unbooked = ship_df[
         (ship_df["Booked SNA"].isna()) | (ship_df["Booked SNA"] == 0)
     ]
     total_unbooked = -unbooked["Shipped MRAS"].sum()  # make it positive
 
-    # --- Step 2: Apply downcounting to PAG Integration ---
+    # Step 2: Apply downcounting
     qty_to_remove = total_unbooked
 
     for idx, row in pag_df.iterrows():
@@ -41,15 +40,13 @@ async def process_files(
         if row["Qty remaining to deliver"] > 0:
             available = row["Qty remaining to deliver"]
             if available <= qty_to_remove:
-                # fully consume this row
                 pag_df.at[idx, "Qty remaining to deliver"] = 0
                 qty_to_remove -= available
             else:
-                # partially consume
                 pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                 qty_to_remove = 0
 
-    # --- Step 3: Return updated Excel ---
+    # Step 3: Return updated Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
