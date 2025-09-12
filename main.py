@@ -25,26 +25,37 @@ async def process_files(
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Step 2: Calculate total unbooked shipped MRAS
-    unbooked = ship_df[
-        (ship_df["Booked SNA"].isna()) | (ship_df["Booked SNA"] == 0)
-    ]
-    total_unbooked = -unbooked["Shipped MRAS"].sum()  # make positive
+    # Step 2: Group Shipment vs Receipt by PO Number + P/N
+    # Match keys: PO Number <-> Purchasing Document, (a)P/N&S/N <-> Material
+    grouped_ship = (
+        ship_df.groupby(["PO Number", "(a)P/N&S/N"])["Total général"]
+        .sum()
+        .reset_index()
+    )
 
-    # Step 3: Apply downcounting to PAG Integration
-    qty_to_remove = total_unbooked
+    # Step 3: Downcount in PAG Integration per (PO Number, Material)
+    for _, row in grouped_ship.iterrows():
+        po_number = row["PO Number"]
+        material = row["(a)P/N&S/N"]
+        qty_to_remove = row["Total général"]
 
-    for idx, row in pag_df.iterrows():
-        if qty_to_remove <= 0:
-            break
-        if row["Qty remaining to deliver"] > 0:
-            available = row["Qty remaining to deliver"]
-            if available <= qty_to_remove:
-                pag_df.at[idx, "Qty remaining to deliver"] = 0
-                qty_to_remove -= available
-            else:
-                pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
-                qty_to_remove = 0
+        # Filter matching rows in PAG Integration
+        matching_rows = pag_df[
+            (pag_df["Purchasing Document"] == po_number) &
+            (pag_df["Material"] == material)
+        ]
+
+        for idx, pag_row in matching_rows.iterrows():
+            if qty_to_remove <= 0:
+                break
+            if pag_row["Qty remaining to deliver"] > 0:
+                available = pag_row["Qty remaining to deliver"]
+                if available <= qty_to_remove:
+                    pag_df.at[idx, "Qty remaining to deliver"] = 0
+                    qty_to_remove -= available
+                else:
+                    pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                    qty_to_remove = 0
 
     # Step 4: Convert datetime columns to MM/DD/YYYY strings
     for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
@@ -63,7 +74,7 @@ async def process_files(
     )
 
 
-# Optional root endpoint for quick check
+# Optional root endpoint
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
