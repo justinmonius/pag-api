@@ -25,15 +25,11 @@ async def process_files(
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Step 2: Calculate total unbooked shipped MRAS
-    unbooked = ship_df[
-        (ship_df["Booked SNA"].isna()) | (ship_df["Booked SNA"] == 0)
-    ]
-    total_unbooked = -unbooked["Shipped MRAS"].sum()  # make positive
+    # Step 2: Calculate total from "Total général" (flip to positive)
+    total_to_remove = -ship_df["Total général"].sum()
 
-    # Step 3: Apply downcounting to PAG Integration
-    qty_to_remove = total_unbooked
-
+    # Step 3: Downcount sequentially in PAG Integration
+    qty_to_remove = total_to_remove
     for idx, row in pag_df.iterrows():
         if qty_to_remove <= 0:
             break
