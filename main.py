@@ -20,12 +20,25 @@ app.add_middleware(
 async def process_files(
     pag_file: UploadFile = File(...),
     ship_file: UploadFile = File(...),
-    subinv_file: UploadFile = File(...)  # NEW
+    subinv_file: UploadFile = File(...)
 ):
     # Step 1: Read Excel files
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
     subinv_df = pd.read_excel(subinv_file.file)
+
+    # -------------------------------
+    # Normalize column names
+    # -------------------------------
+    for df in [pag_df, ship_df, subinv_df]:
+        df.rename(columns=lambda x: str(x).strip(), inplace=True)
+
+    # Standardize "Part #" column across all files
+    if "Material" in pag_df.columns:
+        pag_df.rename(columns={"Material": "Part #"}, inplace=True)
+    if "(a)P/N&S/N" in ship_df.columns:
+        ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
+    # Subinv already uses "Part #"
 
     # -------------------------------
     # ROUND 1: Shipment downcounting
@@ -58,11 +71,11 @@ async def process_files(
     # Get latest SlipDate per Part # where Total général != 0
     latest_dates = (
         ship_df[ship_df["Total général"] != 0]
-        .groupby("(a)P/N&S/N")["SlipDate"]
+        .groupby("Part #")["SlipDate"]
         .max()
     )
 
-    # Convert Sub-Inv date column
+    # Convert Sub-Inv Date column
     subinv_df["Date"] = pd.to_datetime(subinv_df["Date"], errors="coerce")
 
     # Count Sub-Inv rows after cutoff date for each part
@@ -100,7 +113,7 @@ async def process_files(
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
-        # Optional: also save Sub-Inv counts for transparency
+        # Optional: save Sub-Inv counts for transparency
         pd.DataFrame.from_dict(subinv_counts, orient="index", columns=["SubInv_Count"]).to_excel(
             writer, sheet_name="SubInv_Counts"
         )
