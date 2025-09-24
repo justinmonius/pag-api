@@ -33,33 +33,49 @@ async def process_files(
     for df in [pag_df, ship_df, subinv_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-    # Standardize "Part #" column across all files
+    # Standardize column names
     if "Material" in pag_df.columns:
         pag_df.rename(columns={"Material": "Part #"}, inplace=True)
     if "(a)P/N&S/N" in ship_df.columns:
         ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
-    # Subinv already uses "Part #"
+
+    # Make sure PO column names align
+    if "Purchasing Document" not in pag_df.columns:
+        raise ValueError("PAG file must contain 'Purchasing Document' column")
+    if "PO Number" not in ship_df.columns:
+        raise ValueError("Shipment file must contain 'PO Number' column")
 
     # -------------------------------
-    # ROUND 1: Shipment downcounting
+    # ROUND 1: Shipment downcounting (by Part # + PO)
     # -------------------------------
-    total_to_remove = -ship_df["Total général"].sum()
+    # Build a map of total shipped per (Part #, PO Number)
+    shipped_map = (
+        ship_df.groupby(["Part #", "PO Number"])["Total général"]
+        .sum()
+        .to_dict()
+    )
 
-    qty_to_remove = total_to_remove
-    for idx, row in pag_df.iterrows():
+    for (part, po), total_shipped in shipped_map.items():
+        qty_to_remove = -total_shipped  # negative means reduce
         if qty_to_remove <= 0:
-            break
-        if row["Qty remaining to deliver"] > 0:
-            available = row["Qty remaining to deliver"]
-            if available <= qty_to_remove:
-                pag_df.at[idx, "Qty remaining to deliver"] = 0
-                qty_to_remove -= available
-            else:
-                pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
-                qty_to_remove = 0
+            continue
+
+        # Find PAG rows that match both Part # and Purchasing Document
+        mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
+        for idx in pag_df[mask].index:
+            if qty_to_remove <= 0:
+                break
+            if pag_df.at[idx, "Qty remaining to deliver"] > 0:
+                available = pag_df.at[idx, "Qty remaining to deliver"]
+                if available <= qty_to_remove:
+                    pag_df.at[idx, "Qty remaining to deliver"] = 0
+                    qty_to_remove -= available
+                else:
+                    pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                    qty_to_remove = 0
 
     # -------------------------------
-    # ROUND 2: Sub-Inv Transfers downcounting
+    # ROUND 2: Sub-Inv Transfers (still by Part # only)
     # -------------------------------
     # Extract date from PackingSlip (first 8 chars = YYYYMMDD)
     ship_df["SlipDate"] = pd.to_datetime(
@@ -85,7 +101,7 @@ async def process_files(
             mask = (subinv_df["Part #"] == part) & (subinv_df["Date"] > cutoff_date)
             subinv_counts[part] = mask.sum()
 
-    # Apply second round of downcounting in PAG
+    # Apply second round of downcounting in PAG (by Part # only)
     for part, qty_to_remove in subinv_counts.items():
         if qty_to_remove <= 0:
             continue
@@ -113,7 +129,6 @@ async def process_files(
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
-        # Optional: save Sub-Inv counts for transparency
         pd.DataFrame.from_dict(subinv_counts, orient="index", columns=["SubInv_Count"]).to_excel(
             writer, sheet_name="SubInv_Counts"
         )
