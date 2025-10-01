@@ -47,12 +47,28 @@ async def process_files(
     # -------------------------------
     # ROUND 1: Shipment downcounting (by Part # + PO)
     # -------------------------------
+    # Extract SlipDate from PackingSlip
+    ship_df["SlipDate"] = pd.to_datetime(
+        ship_df["PackingSlip"].astype(str).str[:8],
+        format="%Y%m%d",
+        errors="coerce"
+    )
+
+    # Track latest date per (Part, PO)
+    ship_latest_dates = (
+        ship_df[ship_df["Total général"] != 0]
+        .groupby(["Part #", "PO Number"])["SlipDate"]
+        .max()
+    )
+
+    # Build a map of total shipped per (Part #, PO Number)
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
         .to_dict()
     )
 
+    # Apply downcounting
     for (part, po), total_shipped in shipped_map.items():
         qty_to_remove = -total_shipped  # negative means reduce
         if qty_to_remove <= 0:
@@ -74,7 +90,12 @@ async def process_files(
     # -------------------------------
     # ROUND 2: EBU Ship downcounting (by Part # + PO)
     # -------------------------------
-    special_header_sheets = {"Toulouse Shipments", "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"}
+    special_header_sheets = {
+        "Toulouse Shipments",
+        "Rogerville Shipments",
+        "Morocco Shipments",
+        "Tianjin Shipments"
+    }
     ebu_sheets = pd.read_excel(ebu_file.file, sheet_name=None)
 
     ebu_frames = []
@@ -99,14 +120,14 @@ async def process_files(
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
 
         # Find latest Ship Date for each (Part #, PO)
-        latest_dates = (
+        ebu_latest_dates = (
             ebu_df.groupby(["Part #", "PO Number"])["Ship Date"]
             .max()
         )
 
         # Count rows after cutoff date
         ebu_counts = {}
-        for (part, po), cutoff_date in latest_dates.items():
+        for (part, po), cutoff_date in ebu_latest_dates.items():
             if pd.notna(cutoff_date):
                 mask = (
                     (ebu_df["Part #"] == part) &
@@ -134,6 +155,7 @@ async def process_files(
                         qty_to_remove = 0
     else:
         ebu_counts = {}
+        ebu_latest_dates = pd.Series(dtype="datetime64[ns]")
 
     # -------------------------------
     # Final formatting
@@ -153,6 +175,9 @@ async def process_files(
             {str(k): v for k, v in ebu_counts.items()},
             orient="index", columns=["EBU_Count"]
         ).to_excel(writer, sheet_name="EBU_Counts")
+        ebu_latest_dates.reset_index().rename(
+            columns={"Part #": "Part", "PO Number": "PO", "Ship Date": "Latest_Ship_Date"}
+        ).to_excel(writer, index=False, sheet_name="EBU_Latest_Dates")
     output.seek(0)
 
     return StreamingResponse(
