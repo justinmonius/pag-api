@@ -182,7 +182,7 @@ async def process_files(
 
         # Shipment latest dates
         ship_latest_df = ship_latest_dates.reset_index().rename(
-            columns={"Part #": "Part", "PO Number": "PO", "SlipDate": "Latest_SlipDate"}
+            columns={"Part #": "Part #", "PO Number": "PO Number", "SlipDate": "Latest_SlipDate"}
         )
         ship_latest_df.to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
 
