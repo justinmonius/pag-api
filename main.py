@@ -6,7 +6,9 @@ import io
 
 app = FastAPI()
 
-# CORS - allow your frontend (adjust if needed)
+# -------------------------------
+# CORS CONFIGURATION
+# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
@@ -16,6 +18,9 @@ app.add_middleware(
 )
 
 
+# -------------------------------
+# MAIN ENDPOINT
+# -------------------------------
 @app.post("/process")
 async def process_files(
     pag_file: UploadFile = File(...),
@@ -27,7 +32,7 @@ async def process_files(
     ship_df = pd.read_excel(ship_file.file)
 
     # -------------------------------
-    # Normalize column names
+    # NORMALIZE COLUMN NAMES
     # -------------------------------
     for df in [pag_df, ship_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
@@ -38,39 +43,40 @@ async def process_files(
     if "(a)P/N&S/N" in ship_df.columns:
         ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
 
-    # Ensure PO column names exist
+    # Validate required columns
     if "Purchasing Document" not in pag_df.columns:
         raise ValueError("PAG file must contain 'Purchasing Document' column")
     if "PO Number" not in ship_df.columns:
         raise ValueError("Shipment file must contain 'PO Number' column")
 
     # -------------------------------
-    # ROUND 1: Shipment downcounting (by Part # + PO)
+    # ROUND 1: SHIPMENT DOWNCOUNTING (by Part # + PO)
     # -------------------------------
-    # Extract SlipDate from PackingSlip
+
+    # Extract SlipDate from PackingSlip (first 8 chars = YYYYMMDD)
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
         format="%Y%m%d",
         errors="coerce"
     )
 
-    # NEW: Track latest date per (Part, PO) regardless of Total général
+    # NEW: Latest SlipDate per (Part, PO) regardless of Total général
     ship_latest_dates = (
         ship_df
         .groupby(["Part #", "PO Number"])["SlipDate"]
         .max()
     )
 
-    # Build a map of total shipped per (Part #, PO Number)
+    # Build total shipped map per (Part, PO)
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
         .to_dict()
     )
 
-    # Apply downcounting
+    # Apply shipment downcount to PAG
     for (part, po), total_shipped in shipped_map.items():
-        qty_to_remove = -total_shipped  # negative means reduce
+        qty_to_remove = -total_shipped  # negative = reduction
         if qty_to_remove <= 0:
             continue
 
@@ -78,8 +84,8 @@ async def process_files(
         for idx in pag_df[mask].index:
             if qty_to_remove <= 0:
                 break
-            if pag_df.at[idx, "Qty remaining to deliver"] > 0:
-                available = pag_df.at[idx, "Qty remaining to deliver"]
+            available = pag_df.at[idx, "Qty remaining to deliver"]
+            if available > 0:
                 if available <= qty_to_remove:
                     pag_df.at[idx, "Qty remaining to deliver"] = 0
                     qty_to_remove -= available
@@ -88,7 +94,7 @@ async def process_files(
                     qty_to_remove = 0
 
     # -------------------------------
-    # ROUND 2: EBU Ship downcounting (by Part # + PO, using Qty)
+    # ROUND 2: EBU SHIP DOWNCOUNTING (by Part # + PO, using Qty)
     # -------------------------------
     special_header_sheets = {
         "Toulouse Shipments",
@@ -96,9 +102,10 @@ async def process_files(
         "Morocco Shipments",
         "Tianjin Shipments"
     }
-    ebu_sheets = pd.read_excel(ebu_file.file, sheet_name=None)
 
+    ebu_sheets = pd.read_excel(ebu_file.file, sheet_name=None)
     ebu_frames = []
+
     for name in [
         "Toulouse Shipments", "Pylon Shipments", "Hamburg Shipments",
         "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"
@@ -110,6 +117,7 @@ async def process_files(
         df = pd.read_excel(ebu_file.file, sheet_name=name, header=header_row)
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
+        # Keep only necessary columns if all exist
         if "(a)P/N&S/N" in df.columns and "PO Number" in df.columns and "Ship Date" in df.columns and "(f) Qty" in df.columns:
             df = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
             df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
@@ -120,7 +128,7 @@ async def process_files(
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
 
-        # Sum Qty after shipment cutoff date
+        # Sum of Qty after shipment cutoff date
         ebu_counts = {}
         for (part, po), cutoff_date in ship_latest_dates.items():
             if pd.notna(cutoff_date):
@@ -140,8 +148,8 @@ async def process_files(
             for idx in pag_df[mask].index:
                 if qty_to_remove <= 0:
                     break
-                if pag_df.at[idx, "Qty remaining to deliver"] > 0:
-                    available = pag_df.at[idx, "Qty remaining to deliver"]
+                available = pag_df.at[idx, "Qty remaining to deliver"]
+                if available > 0:
                     if available <= qty_to_remove:
                         pag_df.at[idx, "Qty remaining to deliver"] = 0
                         qty_to_remove -= available
@@ -152,29 +160,38 @@ async def process_files(
         ebu_counts = {}
 
     # -------------------------------
-    # Final formatting
+    # FINAL FORMATTING
     # -------------------------------
     for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
         pag_df[col] = pag_df[col].dt.strftime("%m/%d/%Y")
 
-    # Step 5: Return updated Excel
+    # -------------------------------
+    # EXCEL OUTPUT
+    # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Main updated sheet
         pag_df.to_excel(writer, index=False, sheet_name="Updated")
 
-        pd.DataFrame.from_dict(
-            {str(k): v for k, v in shipped_map.items()},
-            orient="index", columns=["Shipped_Total"]
-        ).to_excel(writer, sheet_name="Shipment_Totals")
+        # Shipment totals (separate columns)
+        ship_totals_df = pd.DataFrame([
+            {"Part #": part, "PO Number": po, "Shipped_Total": total}
+            for (part, po), total in shipped_map.items()
+        ])
+        ship_totals_df.to_excel(writer, index=False, sheet_name="Shipment_Totals")
 
-        ship_latest_dates.reset_index().rename(
+        # Shipment latest dates
+        ship_latest_df = ship_latest_dates.reset_index().rename(
             columns={"Part #": "Part", "PO Number": "PO", "SlipDate": "Latest_SlipDate"}
-        ).to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
+        )
+        ship_latest_df.to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
 
-        pd.DataFrame.from_dict(
-            {str(k): v for k, v in ebu_counts.items()},
-            orient="index", columns=["EBU_Qty_AfterCutoff"]
-        ).to_excel(writer, sheet_name="EBU_Qty_AfterCutoff")
+        # EBU Qty After Cutoff (separate columns)
+        ebu_qty_df = pd.DataFrame([
+            {"Part #": part, "PO Number": po, "EBU_Qty_AfterCutoff": qty}
+            for (part, po), qty in ebu_counts.items()
+        ])
+        ebu_qty_df.to_excel(writer, index=False, sheet_name="EBU_Qty_AfterCutoff")
 
     output.seek(0)
 
@@ -185,7 +202,9 @@ async def process_files(
     )
 
 
-# Optional root endpoint for quick check
+# -------------------------------
+# ROOT ENDPOINT
+# -------------------------------
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
