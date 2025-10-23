@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
+from openpyxl.styles import NamedStyle
 
 app = FastAPI()
 
@@ -52,15 +53,13 @@ async def process_files(
     # -------------------------------
     # ROUND 1: SHIPMENT DOWNCOUNTING (by Part # + PO)
     # -------------------------------
-
-    # Extract SlipDate from PackingSlip (first 8 chars = YYYYMMDD)
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
         format="%Y%m%d",
         errors="coerce"
     )
 
-    # NEW: Latest SlipDate per (Part, PO)
+    # Latest SlipDate per (Part, PO)
     ship_latest_dates = (
         ship_df
         .groupby(["Part #", "PO Number"])["SlipDate"]
@@ -117,7 +116,6 @@ async def process_files(
         df = pd.read_excel(ebu_file.file, sheet_name=name, header=header_row)
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-        # Keep only necessary columns if all exist
         if "(a)P/N&S/N" in df.columns and "PO Number" in df.columns and "Ship Date" in df.columns and "(f) Qty" in df.columns:
             df = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
             df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
@@ -128,7 +126,6 @@ async def process_files(
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
 
-        # Sum of Qty after shipment cutoff date
         ebu_counts = {}
         for (part, po), cutoff_date in ship_latest_dates.items():
             if pd.notna(cutoff_date):
@@ -139,7 +136,6 @@ async def process_files(
                 )
                 ebu_counts[(part, po)] = ebu_df.loc[mask, "(f) Qty"].sum()
 
-        # Apply downcounting to PAG
         for (part, po), qty_to_remove in ebu_counts.items():
             if qty_to_remove <= 0:
                 continue
@@ -162,8 +158,10 @@ async def process_files(
     # -------------------------------
     # FINAL FORMATTING
     # -------------------------------
-    for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
-        pag_df[col] = pag_df[col].dt.strftime("%m/%d/%Y")
+    # Ensure all columns with 'Date' in the name are datetime
+    for col in pag_df.columns:
+        if "Date" in col:
+            pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
 
     # ✅ Rename "Part #" to "Material" ONLY for output
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
@@ -173,23 +171,32 @@ async def process_files(
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Main updated sheet
+        # Write main updated sheet
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
 
-        # Shipment totals (separate columns)
+        # Apply date formatting for 'Stat.-Rel Del. Date'
+        ws = writer.sheets["Updated"]
+        date_style = NamedStyle(name="date_style", number_format="MM/DD/YYYY")
+
+        for cell in ws[1]:  # header row
+            if cell.value == "Stat.-Rel Del. Date":
+                col_idx = cell.column_letter
+                for c in ws[col_idx][1:]:
+                    c.style = date_style
+                break
+
+        # Write summary sheets
         ship_totals_df = pd.DataFrame([
             {"Part #": part, "PO Number": po, "Shipped_Total": total}
             for (part, po), total in shipped_map.items()
         ])
         ship_totals_df.to_excel(writer, index=False, sheet_name="Shipment_Totals")
 
-        # Shipment latest dates
         ship_latest_df = ship_latest_dates.reset_index().rename(
             columns={"Part #": "Part #", "PO Number": "PO Number", "SlipDate": "Latest_SlipDate"}
         )
         ship_latest_df.to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
 
-        # EBU Qty After Cutoff (separate columns)
         ebu_qty_df = pd.DataFrame([
             {"Part #": part, "PO Number": po, "EBU_Qty_AfterCutoff": qty}
             for (part, po), qty in ebu_counts.items()
