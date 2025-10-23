@@ -158,7 +158,7 @@ async def process_files(
     # -------------------------------
     # FINAL FORMATTING
     # -------------------------------
-    # Ensure all columns with 'Date' in the name are datetime
+    # Ensure all columns with 'Date' in the name are proper datetimes
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
@@ -174,18 +174,17 @@ async def process_files(
         # Write main updated sheet
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
 
-        # Apply date formatting for 'Stat.-Rel Del. Date'
+        # ✅ Apply date formatting to all columns containing "Date" in header
         ws = writer.sheets["Updated"]
         date_style = NamedStyle(name="date_style", number_format="MM/DD/YYYY")
 
         for cell in ws[1]:  # header row
-            if cell.value == "Stat.-Rel Del. Date":
+            if "Date" in str(cell.value):
                 col_idx = cell.column_letter
                 for c in ws[col_idx][1:]:
                     c.style = date_style
-                break
 
-        # Write summary sheets
+        # Summary sheets
         ship_totals_df = pd.DataFrame([
             {"Part #": part, "PO Number": po, "Shipped_Total": total}
             for (part, po), total in shipped_map.items()
