@@ -60,7 +60,7 @@ async def process_files(
         errors="coerce"
     )
 
-    # NEW: Latest SlipDate per (Part, PO) regardless of Total général
+    # NEW: Latest SlipDate per (Part, PO)
     ship_latest_dates = (
         ship_df
         .groupby(["Part #", "PO Number"])["SlipDate"]
@@ -165,13 +165,16 @@ async def process_files(
     for col in pag_df.select_dtypes(include=["datetime64[ns]"]).columns:
         pag_df[col] = pag_df[col].dt.strftime("%m/%d/%Y")
 
+    # ✅ Rename "Part #" to "Material" ONLY for output
+    pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
+
     # -------------------------------
     # EXCEL OUTPUT
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Main updated sheet
-        pag_df.to_excel(writer, index=False, sheet_name="Updated")
+        pag_output.to_excel(writer, index=False, sheet_name="Updated")
 
         # Shipment totals (separate columns)
         ship_totals_df = pd.DataFrame([
