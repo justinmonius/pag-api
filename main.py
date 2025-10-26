@@ -4,6 +4,8 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 from openpyxl.styles import NamedStyle
+from typing import Optional
+import zipfile
 
 app = FastAPI()
 
@@ -12,7 +14,7 @@ app = FastAPI()
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
+    allow_origins=["https://pag-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -20,15 +22,16 @@ app.add_middleware(
 
 
 # -------------------------------
-# MAIN ENDPOINT
+# MAIN ENDPOINT (Full Process + Optional Delta)
 # -------------------------------
 @app.post("/process")
 async def process_files(
     pag_file: UploadFile = File(...),
     ship_file: UploadFile = File(...),
-    ebu_file: UploadFile = File(...)
+    ebu_file: UploadFile = File(...),
+    old_pag_file: Optional[UploadFile] = File(None)  # optional extra input
 ):
-    # Step 1: Read Excel files
+    # Step 1: Process the three main files to produce updated PAG
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
@@ -51,7 +54,7 @@ async def process_files(
         raise ValueError("Shipment file must contain 'PO Number' column")
 
     # -------------------------------
-    # ROUND 1: SHIPMENT DOWNCOUNTING (by Part # + PO)
+    # ROUND 1: SHIPMENT DOWNCOUNTING
     # -------------------------------
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
@@ -59,14 +62,7 @@ async def process_files(
         errors="coerce"
     )
 
-    # Latest SlipDate per (Part, PO)
-    ship_latest_dates = (
-        ship_df
-        .groupby(["Part #", "PO Number"])["SlipDate"]
-        .max()
-    )
-
-    # Build total shipped map per (Part, PO)
+    ship_latest_dates = ship_df.groupby(["Part #", "PO Number"])["SlipDate"].max()
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
@@ -75,7 +71,7 @@ async def process_files(
 
     # Apply shipment downcount to PAG
     for (part, po), total_shipped in shipped_map.items():
-        qty_to_remove = -total_shipped  # negative = reduction
+        qty_to_remove = -total_shipped
         if qty_to_remove <= 0:
             continue
 
@@ -93,7 +89,7 @@ async def process_files(
                     qty_to_remove = 0
 
     # -------------------------------
-    # ROUND 2: EBU SHIP DOWNCOUNTING (by Part # + PO, using Qty)
+    # ROUND 2: EBU DOWNCOUNTING
     # -------------------------------
     special_header_sheets = {
         "Toulouse Shipments",
@@ -158,54 +154,123 @@ async def process_files(
     # -------------------------------
     # FINAL FORMATTING
     # -------------------------------
-    # Ensure all columns with 'Date' in the name are proper datetimes
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
 
-    # ✅ Rename "Part #" to "Material" ONLY for output
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
 
     # -------------------------------
-    # EXCEL OUTPUT
+    # OUTPUT 1: UPDATED PAG
     # -------------------------------
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Write main updated sheet
+    updated_output = io.BytesIO()
+    with pd.ExcelWriter(updated_output, engine="openpyxl") as writer:
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
 
-        # ✅ Apply date formatting to all columns containing "Date" in header
         ws = writer.sheets["Updated"]
         date_style = NamedStyle(name="date_style", number_format="MM/DD/YYYY")
-
-        for cell in ws[1]:  # header row
+        for cell in ws[1]:
             if "Date" in str(cell.value):
                 col_idx = cell.column_letter
                 for c in ws[col_idx][1:]:
                     c.style = date_style
 
         # Summary sheets
-        ship_totals_df = pd.DataFrame([
+        pd.DataFrame([
             {"Part #": part, "PO Number": po, "Shipped_Total": total}
             for (part, po), total in shipped_map.items()
-        ])
-        ship_totals_df.to_excel(writer, index=False, sheet_name="Shipment_Totals")
+        ]).to_excel(writer, index=False, sheet_name="Shipment_Totals")
 
-        ship_latest_df = ship_latest_dates.reset_index().rename(
-            columns={"Part #": "Part #", "PO Number": "PO Number", "SlipDate": "Latest_SlipDate"}
-        )
-        ship_latest_df.to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
+        ship_latest_dates.reset_index().rename(
+            columns={"SlipDate": "Latest_SlipDate"}
+        ).to_excel(writer, index=False, sheet_name="Shipment_Latest_Dates")
 
-        ebu_qty_df = pd.DataFrame([
+        pd.DataFrame([
             {"Part #": part, "PO Number": po, "EBU_Qty_AfterCutoff": qty}
             for (part, po), qty in ebu_counts.items()
-        ])
-        ebu_qty_df.to_excel(writer, index=False, sheet_name="EBU_Qty_AfterCutoff")
+        ]).to_excel(writer, index=False, sheet_name="EBU_Qty_AfterCutoff")
 
-    output.seek(0)
+    updated_output.seek(0)
 
+    # -------------------------------
+    # STEP 2: DELTA REPORT (if old_pag_file uploaded)
+    # -------------------------------
+    delta_output = None
+    if old_pag_file:
+        old_df = pd.read_excel(old_pag_file.file)
+        new_df = pag_output.copy()
+
+        for df in [new_df, old_df]:
+            df.rename(columns=lambda x: str(x).strip(), inplace=True)
+            if "Part #" in df.columns:
+                df.rename(columns={"Part #": "Material"}, inplace=True)
+
+        # Convert date column
+        for df in [new_df, old_df]:
+            df["Stat.-Rel Del. Date"] = pd.to_datetime(df["Stat.-Rel Del. Date"], errors="coerce")
+            df["Month"] = df["Stat.-Rel Del. Date"].dt.to_period("M").astype(str)
+
+        # Group and aggregate
+        new_grouped = (
+            new_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Qty remaining to deliver": "New_Qty"})
+        )
+
+        old_grouped = (
+            old_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Qty remaining to deliver": "Old_Qty"})
+        )
+
+        merged = pd.merge(
+            new_grouped, old_grouped,
+            on=["Material", "Purchasing Document", "Month"], how="outer"
+        ).fillna(0)
+
+        merged["Delta"] = merged["New_Qty"] - merged["Old_Qty"]
+
+        delta_pivot = (
+            merged.pivot_table(
+                index=["Material", "Purchasing Document"],
+                columns="Month", values="Delta",
+                aggfunc="sum", fill_value=0
+            ).reset_index()
+        )
+
+        delta_pivot.columns.name = None
+        sorted_cols = ["Material", "Purchasing Document"] + sorted(
+            [c for c in delta_pivot.columns if c not in ["Material", "Purchasing Document"]]
+        )
+        delta_pivot = delta_pivot[sorted_cols]
+
+        delta_output = io.BytesIO()
+        with pd.ExcelWriter(delta_output, engine="openpyxl") as writer:
+            delta_pivot.to_excel(writer, index=False, sheet_name="Delta_Pivot")
+
+        delta_output.seek(0)
+
+    # -------------------------------
+    # RETURN BOTH FILES (ZIP if both exist)
+    # -------------------------------
+    if delta_output:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("updated_pag.xlsx", updated_output.getvalue())
+            zf.writestr("delta_report.xlsx", delta_output.getvalue())
+        zip_buffer.seek(0)
+
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=pag_outputs.zip"}
+        )
+
+    # Default: only return updated_pag.xlsx
     return StreamingResponse(
-        output,
+        updated_output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
@@ -217,4 +282,3 @@ async def process_files(
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
-#test
