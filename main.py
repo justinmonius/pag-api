@@ -177,10 +177,18 @@ async def delta_report(
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
         if "Part #" in df.columns:
             df.rename(columns={"Part #": "Material"}, inplace=True)
-        df["Stat.-Rel Del. Date"] = pd.to_datetime(df["Stat.-Rel Del. Date"], errors="coerce")
-        df["Month"] = df["Stat.-Rel Del. Date"].dt.to_period("M").astype(str)
 
-    # Group and merge
+        # Auto-detect Stat-Rel Del Date column
+        possible_cols = [c for c in df.columns if "stat" in c.lower() and "del" in c.lower() and "date" in c.lower()]
+        if not possible_cols:
+            raise ValueError("Could not find 'Stat.-Rel. Del. Date' column in file.")
+        date_col = possible_cols[0]
+        print(f"Detected date column: {date_col}")  # For debugging logs
+
+        df["Stat_Rel_Date"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["Month"] = df["Stat_Rel_Date"].dt.to_period("M").astype(str)
+
+    # Group & merge
     new_grouped = (
         new_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
         .sum().reset_index().rename(columns={"Qty remaining to deliver": "New_Qty"})
@@ -212,7 +220,7 @@ async def delta_report(
     )
     pivot = pivot[sorted_cols]
 
-    # Export delta report
+    # Export
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pivot.to_excel(writer, index=False, sheet_name="Delta_Report")
@@ -225,6 +233,9 @@ async def delta_report(
     )
 
 
+# -------------------------------
+# ROOT ENDPOINT
+# -------------------------------
 @app.get("/")
 def root():
     return {"message": "PAG API is live!"}
