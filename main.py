@@ -12,7 +12,7 @@ app = FastAPI()
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],
+    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,14 +48,19 @@ async def process_files(
     if "PO Number" not in ship_df.columns:
         raise ValueError("Shipment file must contain 'PO Number' column")
 
-    # ROUND 1: Shipment downcounting
+    # -------------------------------
+    # ROUND 1: SHIPMENT DOWNCOUNTING
+    # -------------------------------
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
         format="%Y%m%d",
         errors="coerce"
     )
 
+    # Latest SlipDate per (Part, PO)
     ship_latest_dates = ship_df.groupby(["Part #", "PO Number"])["SlipDate"].max()
+
+    # Total shipped qty map
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
@@ -81,7 +86,9 @@ async def process_files(
                     pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                     qty_to_remove = 0
 
-    # ROUND 2: EBU downcounting
+    # -------------------------------
+    # ROUND 2: EBU DOWNCOUNTING
+    # -------------------------------
     special_header_sheets = {
         "Toulouse Shipments", "Rogerville Shipments",
         "Morocco Shipments", "Tianjin Shipments"
@@ -89,6 +96,7 @@ async def process_files(
 
     ebu_sheets = pd.read_excel(ebu_file.file, sheet_name=None)
     ebu_frames = []
+
     for name in [
         "Toulouse Shipments", "Pylon Shipments", "Hamburg Shipments",
         "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"
@@ -133,14 +141,18 @@ async def process_files(
                         pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                         qty_to_remove = 0
 
+    # -------------------------------
     # FINAL FORMATTING
+    # -------------------------------
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
 
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
 
-    # WRITE UPDATED PAG
+    # -------------------------------
+    # WRITE UPDATED PAG FILE
+    # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
@@ -162,7 +174,7 @@ async def process_files(
 
 
 # -------------------------------
-# STEP 2: DELTA REPORT ENDPOINT
+# STEP 2: DELTA + CUMULATIVE ENDPOINT
 # -------------------------------
 @app.post("/delta")
 async def delta_report(
@@ -183,7 +195,6 @@ async def delta_report(
         if not possible_cols:
             raise ValueError("Could not find 'Stat.-Rel. Del. Date' column in file.")
         date_col = possible_cols[0]
-        print(f"Detected date column: {date_col}")  # For debugging logs
 
         df["Stat_Rel_Date"] = pd.to_datetime(df[date_col], errors="coerce")
         df["Month"] = df["Stat_Rel_Date"].dt.to_period("M").astype(str)
@@ -204,6 +215,7 @@ async def delta_report(
     ).fillna(0)
     merged["Delta"] = merged["New_Qty"] - merged["Old_Qty"]
 
+    # Pivot for month-by-month deltas
     pivot = (
         merged.pivot_table(
             index=["Material", "Purchasing Document"],
@@ -220,10 +232,22 @@ async def delta_report(
     )
     pivot = pivot[sorted_cols]
 
-    # Export
+    # ✅ Create cumulative running totals
+    cumulative = pivot.copy()
+    month_cols = [c for c in cumulative.columns if c not in ["Material", "Purchasing Document"]]
+    for i, col in enumerate(month_cols):
+        if i == 0:
+            continue
+        prev_col = month_cols[i - 1]
+        cumulative[col] = cumulative[prev_col] + cumulative[col]
+
+    # -------------------------------
+    # EXPORT BOTH SHEETS
+    # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pivot.to_excel(writer, index=False, sheet_name="Delta_Report")
+        cumulative.to_excel(writer, index=False, sheet_name="Cumulative")
 
     output.seek(0)
     return StreamingResponse(
