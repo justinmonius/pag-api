@@ -4,6 +4,8 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 from openpyxl.styles import NamedStyle
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import PatternFill
 
 app = FastAPI()
 
@@ -12,7 +14,7 @@ app = FastAPI()
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
+    allow_origins=["https://pag-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,51 +30,40 @@ async def process_files(
     ship_file: UploadFile = File(...),
     ebu_file: UploadFile = File(...)
 ):
-    # Step 1: Read Excel files
     pag_df = pd.read_excel(pag_file.file)
     ship_df = pd.read_excel(ship_file.file)
 
-    # Normalize column names
     for df in [pag_df, ship_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-    # Standardize column names
     if "Material" in pag_df.columns:
         pag_df.rename(columns={"Material": "Part #"}, inplace=True)
     if "(a)P/N&S/N" in ship_df.columns:
         ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
 
-    # Validate required columns
     if "Purchasing Document" not in pag_df.columns:
         raise ValueError("PAG file must contain 'Purchasing Document' column")
     if "PO Number" not in ship_df.columns:
         raise ValueError("Shipment file must contain 'PO Number' column")
 
-    # -------------------------------
-    # ROUND 1: SHIPMENT DOWNCOUNTING
-    # -------------------------------
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
         format="%Y%m%d",
         errors="coerce"
     )
 
-    # Latest SlipDate per (Part, PO)
     ship_latest_dates = ship_df.groupby(["Part #", "PO Number"])["SlipDate"].max()
-
-    # Total shipped qty map
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
         .to_dict()
     )
 
-    # Apply shipment downcount
+    # Downcounting logic
     for (part, po), total_shipped in shipped_map.items():
         qty_to_remove = -total_shipped
         if qty_to_remove <= 0:
             continue
-
         mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
         for idx in pag_df[mask].index:
             if qty_to_remove <= 0:
@@ -87,7 +78,7 @@ async def process_files(
                     qty_to_remove = 0
 
     # -------------------------------
-    # ROUND 2: EBU DOWNCOUNTING
+    # READ EBU FILES (INCL. PRICE)
     # -------------------------------
     special_header_sheets = {
         "Toulouse Shipments", "Rogerville Shipments",
@@ -106,16 +97,24 @@ async def process_files(
         header_row = 1 if name in special_header_sheets else 0
         df = pd.read_excel(ebu_file.file, sheet_name=name, header=header_row)
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
-        if "(a)P/N&S/N" in df.columns and "PO Number" in df.columns and "Ship Date" in df.columns and "(f) Qty" in df.columns:
-            df = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
+        if all(col in df.columns for col in ["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]):
+            df = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty", "(g) Unit/Lot (Repair) Price"]].copy()
             df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
             df["Ship Date"] = pd.to_datetime(df["Ship Date"], errors="coerce")
             df["(f) Qty"] = pd.to_numeric(df["(f) Qty"], errors="coerce").fillna(0)
+            df["(g) Unit/Lot (Repair) Price"] = pd.to_numeric(df["(g) Unit/Lot (Repair) Price"], errors="coerce").fillna(0)
             ebu_frames.append(df)
 
-    ebu_counts = {}
+    price_map = {}
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
+        price_map = (
+            ebu_df.groupby(["Part #", "PO Number"])["(g) Unit/Lot (Repair) Price"]
+            .mean()
+            .to_dict()
+        )
+
+        ebu_counts = {}
         for (part, po), cutoff_date in ship_latest_dates.items():
             if pd.notna(cutoff_date):
                 mask = (
@@ -141,29 +140,22 @@ async def process_files(
                         pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                         qty_to_remove = 0
 
-    # -------------------------------
-    # FINAL FORMATTING
-    # -------------------------------
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
 
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
 
-    # -------------------------------
-    # WRITE UPDATED PAG FILE
-    # -------------------------------
+    # Save price map for later delta revenue use
+    price_df = pd.DataFrame(
+        [{"Material": k[0], "Purchasing Document": k[1], "Unit_Price": v} for k, v in price_map.items()]
+    )
+
+    # Write output Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
-
-        ws = writer.sheets["Updated"]
-        date_style = NamedStyle(name="date_style", number_format="MM/DD/YYYY")
-        for cell in ws[1]:
-            if "Date" in str(cell.value):
-                col_idx = cell.column_letter
-                for c in ws[col_idx][1:]:
-                    c.style = date_style
+        price_df.to_excel(writer, index=False, sheet_name="Price_Map")
 
     output.seek(0)
     return StreamingResponse(
@@ -174,23 +166,23 @@ async def process_files(
 
 
 # -------------------------------
-# STEP 2: DELTA + CUMULATIVE ENDPOINT
+# STEP 2: DELTA + CUMULATIVE + REVENUE
 # -------------------------------
 @app.post("/delta")
 async def delta_report(
     new_file: UploadFile = File(...),
-    old_file: UploadFile = File(...)
+    old_file: UploadFile = File(...),
+    price_file: UploadFile = File(...)
 ):
     new_df = pd.read_excel(new_file.file)
     old_df = pd.read_excel(old_file.file)
+    price_df = pd.read_excel(price_file.file, sheet_name="Price_Map")
 
-    # Normalize & rename
     for df in [new_df, old_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
         if "Part #" in df.columns:
             df.rename(columns={"Part #": "Material"}, inplace=True)
 
-        # Auto-detect Stat-Rel Del Date column
         possible_cols = [c for c in df.columns if "stat" in c.lower() and "del" in c.lower() and "date" in c.lower()]
         if not possible_cols:
             raise ValueError("Could not find 'Stat.-Rel. Del. Date' column in file.")
@@ -199,7 +191,6 @@ async def delta_report(
         df["Stat_Rel_Date"] = pd.to_datetime(df[date_col], errors="coerce")
         df["Month"] = df["Stat_Rel_Date"].dt.to_period("M").astype(str)
 
-    # Group & merge
     new_grouped = (
         new_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
         .sum().reset_index().rename(columns={"Qty remaining to deliver": "New_Qty"})
@@ -215,8 +206,12 @@ async def delta_report(
     ).fillna(0)
     merged["Delta"] = merged["New_Qty"] - merged["Old_Qty"]
 
-    # Pivot for month-by-month deltas
-    pivot = (
+    # Merge in unit prices for revenue calc
+    merged = merged.merge(price_df, on=["Material", "Purchasing Document"], how="left").fillna(0)
+    merged["Revenue_Delta"] = merged["Delta"] * merged["Unit_Price"]
+
+    # Pivot: Quantity Deltas
+    pivot_qty = (
         merged.pivot_table(
             index=["Material", "Purchasing Document"],
             columns="Month",
@@ -226,28 +221,44 @@ async def delta_report(
         ).reset_index()
     )
 
-    pivot.columns.name = None
+    pivot_qty.columns.name = None
     sorted_cols = ["Material", "Purchasing Document"] + sorted(
-        [c for c in pivot.columns if c not in ["Material", "Purchasing Document"]]
+        [c for c in pivot_qty.columns if c not in ["Material", "Purchasing Document"]]
     )
-    pivot = pivot[sorted_cols]
+    pivot_qty = pivot_qty[sorted_cols]
 
-    # ✅ Create cumulative running totals
-    cumulative = pivot.copy()
+    # Cumulative totals
+    cumulative = pivot_qty.copy()
     month_cols = [c for c in cumulative.columns if c not in ["Material", "Purchasing Document"]]
     for i, col in enumerate(month_cols):
         if i == 0:
             continue
-        prev_col = month_cols[i - 1]
-        cumulative[col] = cumulative[prev_col] + cumulative[col]
+        cumulative[col] = cumulative[month_cols[i - 1]] + cumulative[col]
+
+    # Revenue deltas
+    pivot_rev = (
+        merged.pivot_table(
+            index=["Material", "Purchasing Document"],
+            columns="Month",
+            values="Revenue_Delta",
+            aggfunc="sum",
+            fill_value=0
+        ).reset_index()
+    )
+    pivot_rev.columns.name = None
+    sorted_cols_rev = ["Material", "Purchasing Document"] + sorted(
+        [c for c in pivot_rev.columns if c not in ["Material", "Purchasing Document"]]
+    )
+    pivot_rev = pivot_rev[sorted_cols_rev]
 
     # -------------------------------
-    # EXPORT BOTH SHEETS
+    # EXPORT ALL 3 SHEETS
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pivot.to_excel(writer, index=False, sheet_name="Delta_Report")
+        pivot_qty.to_excel(writer, index=False, sheet_name="Delta_Report")
         cumulative.to_excel(writer, index=False, sheet_name="Cumulative")
+        pivot_rev.to_excel(writer, index=False, sheet_name="Revenue_Delta")
 
     output.seek(0)
     return StreamingResponse(
@@ -258,7 +269,7 @@ async def delta_report(
 
 
 # -------------------------------
-# ROOT ENDPOINT
+# ROOT
 # -------------------------------
 @app.get("/")
 def root():
