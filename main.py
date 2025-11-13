@@ -25,9 +25,11 @@ EBU_SHEETS = [
 ]
 SPECIAL_HEADER_SHEETS = {"Toulouse Shipments", "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"}
 
+
 def read_excel(file, **kw):
     # Force openpyxl to avoid engine detection issues on some hosts
     return pd.read_excel(file, engine="openpyxl", **kw)
+
 
 # -------------------------------
 # STEP 1: MAIN PROCESS ENDPOINT
@@ -70,7 +72,7 @@ async def process_files(
     # Latest SlipDate per (Part, PO)
     ship_latest_dates = ship_df.groupby(["Part #", "PO Number"])["SlipDate"].max()
 
-    # Total shipped qty map
+    # Total shipped qty map (Step 1 downcount totals)
     shipped_map = (
         ship_df.groupby(["Part #", "PO Number"])["Total général"]
         .sum()
@@ -79,6 +81,7 @@ async def process_files(
 
     # Apply shipment downcount
     for (part, po), total_shipped in shipped_map.items():
+        # qty_to_remove is negative by design in your original logic
         qty_to_remove = -total_shipped
         if qty_to_remove <= 0:
             continue
@@ -129,6 +132,7 @@ async def process_files(
             price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
             price_frames.append(price_df)
 
+    # EBU downcount totals (Step 2)
     ebu_counts = {}
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
@@ -175,6 +179,41 @@ async def process_files(
         price_lookup = pd.DataFrame(columns=["Material", "Purchasing Document", "Unit_Price"])
 
     # -------------------------------
+    # BUILD SUMMARY SHEETS
+    # -------------------------------
+
+    # 1) Latest_Dates (from shipment file, per Part # + PO Number)
+    latest_dates_df = (
+        ship_latest_dates
+        .reset_index()
+        .rename(columns={
+            "Part #": "Material",
+            "PO Number": "Purchasing Document",
+            "SlipDate": "Latest_SlipDate"
+        })
+    )
+
+    # 2) Step1_Downcount: total shipped quantity per Part–PO (positive)
+    step1_rows = []
+    for (part, po), total_shipped in shipped_map.items():
+        step1_rows.append({
+            "Material": part,
+            "Purchasing Document": po,
+            "Step1_Downcount": max(total_shipped, 0)  # ensure positive
+        })
+    step1_df = pd.DataFrame(step1_rows)
+
+    # 3) Step2_Downcount: total EBU quantity after cutoff per Part–PO (positive)
+    step2_rows = []
+    for (part, po), qty in ebu_counts.items():
+        step2_rows.append({
+            "Material": part,
+            "Purchasing Document": po,
+            "Step2_Downcount": max(qty, 0)  # ensure positive
+        })
+    step2_df = pd.DataFrame(step2_rows)
+
+    # -------------------------------
     # FINAL FORMATTING
     # -------------------------------
     for col in pag_df.columns:
@@ -188,11 +227,20 @@ async def process_files(
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Main updated sheet
-        pag_output.to_excel(writer, index=False, sheet_name="Updated")
+        # ✅ 1) Latest dates per Part–PO (from shipment file)
+        latest_dates_df.to_excel(writer, index=False, sheet_name="Latest_Dates")
 
-        # Price lookup for later revenue calculations
+        # ✅ 2) Step 1 downcount totals
+        step1_df.to_excel(writer, index=False, sheet_name="Step1_Downcount")
+
+        # ✅ 3) Step 2 downcount totals
+        step2_df.to_excel(writer, index=False, sheet_name="Step2_Downcount")
+
+        # ✅ 4) Price lookup for later revenue calculations
         price_lookup.to_excel(writer, index=False, sheet_name="Price_Lookup")
+
+        # ✅ 5) Main updated sheet
+        pag_output.to_excel(writer, index=False, sheet_name="Updated")
 
         # Apply date formatting to all "Date" columns in Updated
         ws = writer.sheets["Updated"]
@@ -209,6 +257,7 @@ async def process_files(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
+
 
 # -------------------------------
 # STEP 2: DELTA + CUMULATIVE + REVENUE ENDPOINT
@@ -325,6 +374,7 @@ async def delta_report(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=delta_report.xlsx"}
     )
+
 
 # -------------------------------
 # ROOT ENDPOINT
