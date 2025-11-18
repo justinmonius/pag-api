@@ -31,12 +31,13 @@ def read_excel(file, **kw):
     return pd.read_excel(file, engine="openpyxl", **kw)
 
 
-def normalize_key_cols(df, part_col=None, po_col=None):
-    """Convert key columns to stripped strings if they exist."""
-    if part_col and part_col in df.columns:
-        df[part_col] = df[part_col].astype(str).str.strip()
-    if po_col and po_col in df.columns:
-        df[po_col] = df[po_col].astype(str).str.strip()
+def normalize_ids(df):
+    """
+    Normalize ID-like columns as stripped strings so joins and masks line up.
+    """
+    for col in ["Part #", "Purchasing Document", "PO Number"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
     return df
 
 
@@ -63,15 +64,31 @@ async def process_files(
     if "(a)P/N&S/N" in ship_df.columns:
         ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
 
-    # Normalize key columns as strings
-    pag_df = normalize_key_cols(pag_df, part_col="Part #", po_col="Purchasing Document")
-    ship_df = normalize_key_cols(ship_df, part_col="Part #", po_col="PO Number")
+    # Normalize ID columns and quantities
+    pag_df = normalize_ids(pag_df)
+    ship_df = normalize_ids(ship_df)
+
+    if "Qty remaining to deliver" in pag_df.columns:
+        pag_df["Qty remaining to deliver"] = pd.to_numeric(
+            pag_df["Qty remaining to deliver"], errors="coerce"
+        ).fillna(0)
+
+    if "Total général" in ship_df.columns:
+        ship_df["Total général"] = pd.to_numeric(
+            ship_df["Total général"], errors="coerce"
+        ).fillna(0)
 
     # Validate required columns
     if "Purchasing Document" not in pag_df.columns:
         raise ValueError("PAG file must contain 'Purchasing Document' column")
     if "PO Number" not in ship_df.columns:
         raise ValueError("Shipment file must contain 'PO Number' column")
+
+    # -------------------------------
+    # SNAPSHOT BEFORE ANY DOWNCOUNTING
+    # -------------------------------
+    original_snapshot = pag_df[["Part #", "Purchasing Document", "Qty remaining to deliver"]].copy()
+    original_snapshot.rename(columns={"Qty remaining to deliver": "Qty_Original"}, inplace=True)
 
     # -------------------------------
     # ROUND 1: SHIPMENT DOWNCOUNTING
@@ -92,60 +109,71 @@ async def process_files(
         .to_dict()
     )
 
-    # Track how much we downcounted in Step 1 per (Material, PO)
-    step1_downcounts = {}
-
-    # Apply shipment downcount
+    # Apply shipment downcount (Round 1)
     for (part, po), total_shipped in shipped_map.items():
-        # NOTE: In your files "Total général" is negative, so we negate.
-        qty_to_remove = -total_shipped
+        # NOTE: if Total_general is negative in your data, keep the minus.
+        # Here we assume shipped quantities are positive and we subtract them.
+        qty_to_remove = total_shipped
         if qty_to_remove <= 0:
             continue
 
-        mask = (pag_df["Part #"] == str(part)) & (pag_df["Purchasing Document"] == str(po))
+        part_str = str(part).strip()
+        po_str = str(po).strip()
+        mask = (pag_df["Part #"] == part_str) & (pag_df["Purchasing Document"] == po_str)
+
         for idx in pag_df[mask].index:
             if qty_to_remove <= 0:
                 break
             available = pag_df.at[idx, "Qty remaining to deliver"]
             if pd.notna(available) and available > 0:
-                available = float(available)
-                remove_here = min(available, qty_to_remove)
-                new_val = available - remove_here
-                pag_df.at[idx, "Qty remaining to deliver"] = new_val
-                qty_to_remove -= remove_here
+                if available <= qty_to_remove:
+                    pag_df.at[idx, "Qty remaining to deliver"] = 0
+                    qty_to_remove -= available
+                else:
+                    pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                    qty_to_remove = 0
 
-                key = (str(part), str(po))
-                step1_downcounts[key] = step1_downcounts.get(key, 0) + remove_here
+    # Snapshot after Round 1
+    after_step1_snapshot = pag_df[["Part #", "Purchasing Document", "Qty remaining to deliver"]].copy()
+    after_step1_snapshot.rename(columns={"Qty remaining to deliver": "Qty_After_Step1"}, inplace=True)
 
     # -------------------------------
     # ROUND 2: EBU DOWNCOUNTING (quantities) + BUILD PRICE LOOKUP
     # -------------------------------
-    ebu_sheets_all = read_excel(ebu_file.file, sheet_name=None)
+    # Read all EBU sheets ONCE to avoid file pointer exhaustion
+    ebu_raw = read_excel(ebu_file.file, sheet_name=None, header=None)
     ebu_frames = []
     price_frames = []
 
     for name in EBU_SHEETS:
-        if name not in ebu_sheets_all:
+        if name not in ebu_raw:
             continue
-        df = ebu_sheets_all[name].copy()
-        header_row = 1 if name in SPECIAL_HEADER_SHEETS else 0
-        # If the sheet wasn't read with correct header, re-read with proper header
-        if header_row != 0:
-            df = read_excel(ebu_file.file, sheet_name=name, header=header_row)
 
+        raw = ebu_raw[name]
+        # Determine header row
+        header_row = 1 if name in SPECIAL_HEADER_SHEETS else 0
+
+        # Build a proper header + data frame
+        header = raw.iloc[header_row]
+        data = raw.iloc[header_row + 1:].copy()
+        data.columns = header
+        df = data.copy()
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-        # For downcounting
+        # Normalize IDs in this sheet
+        df = normalize_ids(df)
+
+        # For downcounting (quantities)
         if {"(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"}.issubset(df.columns):
             ship_df2 = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
-            # Normalize keys
             ship_df2.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
-            ship_df2 = normalize_key_cols(ship_df2, part_col="Part #", po_col="PO Number")
+            ship_df2 = normalize_ids(ship_df2)
+
             ship_df2["Ship Date"] = pd.to_datetime(ship_df2["Ship Date"], errors="coerce")
             ship_df2["(f) Qty"] = pd.to_numeric(ship_df2["(f) Qty"], errors="coerce").fillna(0)
             ebu_frames.append(ship_df2)
 
-        # For price lookup (unit price) — STRICT column name
+        # For price lookup (unit price)
         if {"(a)P/N&S/N", "PO Number", "(g) Unit/Lot (Repair) Price"}.issubset(df.columns):
             price_df = df[["(a)P/N&S/N", "PO Number", "(g) Unit/Lot (Repair) Price"]].copy()
             price_df.rename(columns={
@@ -153,56 +181,104 @@ async def process_files(
                 "PO Number": "Purchasing Document",
                 "(g) Unit/Lot (Repair) Price": "Unit_Price"
             }, inplace=True)
-            price_df = normalize_key_cols(price_df, part_col="Material", po_col="Purchasing Document")
+
+            price_df["Material"] = price_df["Material"].astype(str).str.strip()
+            price_df["Purchasing Document"] = price_df["Purchasing Document"].astype(str).str.strip()
             price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
             price_frames.append(price_df)
 
-    ebu_counts = {}
-    step2_downcounts = {}
-
+    # Round 2 downcounting
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
-        # Ensure keys are strings
-        ebu_df = normalize_key_cols(ebu_df, part_col="Part #", po_col="PO Number")
+        ebu_df = normalize_ids(ebu_df)
 
+        ebu_counts = {}
         for (part, po), cutoff_date in ship_latest_dates.items():
-            if pd.notna(cutoff_date):
-                part_str = str(part).strip()
-                po_str = str(po).strip()
-                mask = (
-                    (ebu_df["Part #"] == part_str) &
-                    (ebu_df["PO Number"] == po_str) &
-                    (ebu_df["Ship Date"] > cutoff_date)
-                )
-                ebu_counts[(part_str, po_str)] = float(ebu_df.loc[mask, "(f) Qty"].sum())
+            if pd.isna(cutoff_date):
+                continue
+            part_str = str(part).strip()
+            po_str = str(po).strip()
+            mask = (
+                (ebu_df["Part #"] == part_str) &
+                (ebu_df["PO Number"] == po_str) &
+                (ebu_df["Ship Date"] > cutoff_date)
+            )
+            qty_sum = ebu_df.loc[mask, "(f) Qty"].sum()
+            if qty_sum != 0:
+                ebu_counts[(part_str, po_str)] = qty_sum
 
         # Apply downcounting from EBU shipments after cutoff
-        for (part, po), qty_to_remove_init in ebu_counts.items():
-            qty_to_remove = qty_to_remove_init
+        for (part_str, po_str), qty_to_remove in ebu_counts.items():
             if qty_to_remove <= 0:
                 continue
-            mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
+            mask = (pag_df["Part #"] == part_str) & (pag_df["Purchasing Document"] == po_str)
             for idx in pag_df[mask].index:
                 if qty_to_remove <= 0:
                     break
                 available = pag_df.at[idx, "Qty remaining to deliver"]
                 if pd.notna(available) and available > 0:
-                    available = float(available)
-                    remove_here = min(available, qty_to_remove)
-                    new_val = available - remove_here
-                    pag_df.at[idx, "Qty remaining to deliver"] = new_val
-                    qty_to_remove -= remove_here
+                    if available <= qty_to_remove:
+                        pag_df.at[idx, "Qty remaining to deliver"] = 0
+                        qty_to_remove -= available
+                    else:
+                        pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                        qty_to_remove = 0
 
-                    key = (part, po)
-                    step2_downcounts[key] = step2_downcounts.get(key, 0) + remove_here
+    # Snapshot after Round 2
+    after_step2_snapshot = pag_df[["Part #", "Purchasing Document", "Qty remaining to deliver"]].copy()
+    after_step2_snapshot.rename(columns={"Qty remaining to deliver": "Qty_Final"}, inplace=True)
 
-    # Build Price_Lookup sheet (unique per Material + Purchasing Document)
+    # -------------------------------
+    # BUILD STEP1 & STEP2 DOWNCOUNT SHEETS
+    # -------------------------------
+    # Step 1 downcount = Original - After_Step1
+    step1_merge = original_snapshot.merge(
+        after_step1_snapshot,
+        on=["Part #", "Purchasing Document"],
+        how="outer"
+    ).fillna(0)
+
+    for col in ["Qty_Original", "Qty_After_Step1"]:
+        step1_merge[col] = pd.to_numeric(step1_merge[col], errors="coerce").fillna(0)
+
+    step1_merge["Step1_Downcount"] = step1_merge["Qty_Original"] - step1_merge["Qty_After_Step1"]
+
+    step1_summary = (
+        step1_merge
+        .groupby(["Part #", "Purchasing Document"])["Step1_Downcount"]
+        .sum()
+        .reset_index()
+    )
+    step1_summary.rename(columns={"Part #": "Material"}, inplace=True)
+
+    # Step 2 downcount = After_Step1 - Final
+    step2_merge = after_step1_snapshot.merge(
+        after_step2_snapshot,
+        on=["Part #", "Purchasing Document"],
+        how="outer"
+    ).fillna(0)
+
+    for col in ["Qty_After_Step1", "Qty_Final"]:
+        step2_merge[col] = pd.to_numeric(step2_merge[col], errors="coerce").fillna(0)
+
+    step2_merge["Step2_Downcount"] = step2_merge["Qty_After_Step1"] - step2_merge["Qty_Final"]
+
+    step2_summary = (
+        step2_merge
+        .groupby(["Part #", "Purchasing Document"])["Step2_Downcount"]
+        .sum()
+        .reset_index()
+    )
+    step2_summary.rename(columns={"Part #": "Material"}, inplace=True)
+
+    # -------------------------------
+    # BUILD Price_Lookup SHEET
+    # -------------------------------
     if price_frames:
         price_lookup = (
             pd.concat(price_frames, ignore_index=True)
-            .sort_values(["Material", "Purchasing Document"])  # deterministic order
+            .sort_values(["Material", "Purchasing Document"])
         )
-        # If multiple prices per (Material, PO), pick the last non-null encountered
         price_lookup = (
             price_lookup
             .dropna(subset=["Material", "Purchasing Document"])
@@ -213,45 +289,27 @@ async def process_files(
         price_lookup = pd.DataFrame(columns=["Material", "Purchasing Document", "Unit_Price"])
 
     # -------------------------------
-    # FINAL FORMATTING
+    # FINAL FORMATTING & LATEST DATES
     # -------------------------------
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
 
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
-    pag_output = normalize_key_cols(pag_output, part_col="Material", po_col="Purchasing Document")
 
-    # Step 1 Downcount sheet
-    if step1_downcounts:
-        s1_rows = [
-            {"Material": k[0], "Purchasing Document": k[1], "Step_1_Down_Qty": v}
-            for k, v in step1_downcounts.items() if v != 0
-        ]
-        step1_df = pd.DataFrame(s1_rows)
-        step1_df = step1_df.sort_values(["Material", "Purchasing Document"]).reset_index(drop=True)
-    else:
-        step1_df = pd.DataFrame(columns=["Material", "Purchasing Document", "Step_1_Down_Qty"])
-
-    # Step 2 Downcount sheet
-    if step2_downcounts:
-        s2_rows = [
-            {"Material": k[0], "Purchasing Document": k[1], "Step_2_Down_Qty": v}
-            for k, v in step2_downcounts.items() if v != 0
-        ]
-        step2_df = pd.DataFrame(s2_rows)
-        step2_df = step2_df.sort_values(["Material", "Purchasing Document"]).reset_index(drop=True)
-    else:
-        step2_df = pd.DataFrame(columns=["Material", "Purchasing Document", "Step_2_Down_Qty"])
-
-    # Latest Ship Dates per part/PO (from ship_df)
-    latest_dates_df = ship_latest_dates.reset_index()
-    latest_dates_df.rename(columns={
-        "Part #": "Material",
-        "PO Number": "Purchasing Document",
-        "SlipDate": "Latest_SlipDate"
-    }, inplace=True)
-    latest_dates_df = normalize_key_cols(latest_dates_df, part_col="Material", po_col="Purchasing Document")
+    # Latest Stat-Rel Del Date per Material+PO
+    latest_dates = pd.DataFrame()
+    stat_cols = [c for c in pag_output.columns
+                 if "stat" in c.lower() and "del" in c.lower() and "date" in c.lower()]
+    if stat_cols:
+        date_col = stat_cols[0]
+        latest_dates = (
+            pag_output
+            .groupby(["Material", "Purchasing Document"])[date_col]
+            .max()
+            .reset_index()
+            .rename(columns={date_col: "Latest_StatRel_Del_Date"})
+        )
 
     # -------------------------------
     # WRITE UPDATED PAG FILE
@@ -265,13 +323,14 @@ async def process_files(
         price_lookup.to_excel(writer, index=False, sheet_name="Price_Lookup")
 
         # 3) Step 1 downcount summary
-        step1_df.to_excel(writer, index=False, sheet_name="Step_1_Downcount")
+        step1_summary.to_excel(writer, index=False, sheet_name="Step1_Downcount")
 
         # 4) Step 2 downcount summary
-        step2_df.to_excel(writer, index=False, sheet_name="Step_2_Downcount")
+        step2_summary.to_excel(writer, index=False, sheet_name="Step2_Downcount")
 
-        # 5) Latest ship dates summary
-        latest_dates_df.to_excel(writer, index=False, sheet_name="Latest_Ship_Dates")
+        # 5) Latest dates
+        if not latest_dates.empty:
+            latest_dates.to_excel(writer, index=False, sheet_name="Latest_Dates")
 
         # Apply date formatting to all "Date" columns in Updated
         ws = writer.sheets["Updated"]
@@ -317,13 +376,6 @@ async def delta_report(
         # Ensure Material naming
         if "Part #" in df.columns:
             df.rename(columns={"Part #": "Material"}, inplace=True)
-
-        # Normalize key columns as strings
-        if "Material" in df.columns:
-            df["Material"] = df["Material"].astype(str).str.strip()
-        if "Purchasing Document" in df.columns:
-            df["Purchasing Document"] = df["Purchasing Document"].astype(str).str.strip()
-
         # Auto-detect Stat.-Rel. Del. Date column
         possible_cols = [c for c in df.columns if "stat" in c.lower() and "del" in c.lower() and "date" in c.lower()]
         if not possible_cols:
@@ -368,7 +420,7 @@ async def delta_report(
     cumulative = pivot.copy()
     month_cols = [c for c in cumulative.columns if c not in ["Material", "Purchasing Document"]]
     for i in range(1, len(month_cols)):
-        cumulative[month_cols[i]] = cumulative[month_cols[i - 1]] + cumulative[month_cols[i]]
+        cumulative[month_cols[i]] = cumulative[month_cols[i-1]] + cumulative[month_cols[i]]
 
     # -------------------------------
     # REVENUE: merge price from Price_Lookup
@@ -383,12 +435,7 @@ async def delta_report(
     price_df["Purchasing Document"] = price_df["Purchasing Document"].astype(str).str.strip()
     price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
 
-    merged_price = merged.merge(
-        price_df,
-        on=["Material", "Purchasing Document"],
-        how="left"
-    ).fillna({"Unit_Price": 0})
-
+    merged_price = merged.merge(price_df, on=["Material", "Purchasing Document"], how="left").fillna({"Unit_Price": 0})
     merged_price["Revenue"] = merged_price["Delta"] * merged_price["Unit_Price"]
 
     revenue_pivot = merged_price.pivot_table(
