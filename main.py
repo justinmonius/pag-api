@@ -12,7 +12,7 @@ app = FastAPI()
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pag-frontend.vercel.app"],  # your Vercel frontend URL
+    allow_origins=["https://pag-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,14 +23,17 @@ EBU_SHEETS = [
     "Toulouse Shipments", "Pylon Shipments", "Hamburg Shipments",
     "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"
 ]
-SPECIAL_HEADER_SHEETS = {"Toulouse Shipments", "Rogerville Shipments", "Morocco Shipments", "Tianjin Shipments"}
+SPECIAL_HEADER_SHEETS = {
+    "Toulouse Shipments", "Rogerville Shipments",
+    "Morocco Shipments", "Tianjin Shipments"
+}
 
 def read_excel(file, **kw):
-    # Force openpyxl to avoid engine detection issues on some hosts
     return pd.read_excel(file, engine="openpyxl", **kw)
 
+
 # -------------------------------
-# STEP 1: MAIN PROCESS ENDPOINT
+# STEP 1: PROCESS ENDPOINT
 # -------------------------------
 @app.post("/process")
 async def process_files(
@@ -38,68 +41,79 @@ async def process_files(
     ship_file: UploadFile = File(...),
     ebu_file: UploadFile = File(...)
 ):
-    # Step 1: Read Excel files
+
     pag_df = read_excel(pag_file.file)
     ship_df = read_excel(ship_file.file)
 
-    # Normalize column names
+    # Normalize
     for df in [pag_df, ship_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-    # Standardize column names
+    # Standardize naming
     if "Material" in pag_df.columns:
         pag_df.rename(columns={"Material": "Part #"}, inplace=True)
     if "(a)P/N&S/N" in ship_df.columns:
         ship_df.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
 
-    # Validate required columns
+    # Normalize PO column so it matches PAG
+    ship_df.rename(columns={"PO Number": "Purchasing Document"}, inplace=True)
+
     if "Purchasing Document" not in pag_df.columns:
-        raise ValueError("PAG file must contain 'Purchasing Document' column")
-    if "PO Number" not in ship_df.columns:
-        raise ValueError("Shipment file must contain 'PO Number' column")
+        raise ValueError("PAG file must contain 'Purchasing Document'")
+    if "Purchasing Document" not in ship_df.columns:
+        raise ValueError("Shipment file must contain 'PO Number' (now mapped to Purchasing Document)")
 
     # -------------------------------
     # ROUND 1: SHIPMENT DOWNCOUNTING
     # -------------------------------
     ship_df["SlipDate"] = pd.to_datetime(
         ship_df["PackingSlip"].astype(str).str[:8],
-        format="%Y%m%d",
-        errors="coerce"
+        format="%Y%m%d", errors="coerce"
     )
 
-    # Latest SlipDate per (Part, PO)
-    ship_latest_dates = ship_df.groupby(["Part #", "PO Number"])["SlipDate"].max()
+    # Latest SlipDate
+    ship_latest_dates = ship_df.groupby(
+        ["Part #", "Purchasing Document"]
+    )["SlipDate"].max()
 
-    # Total shipped qty map
+    # Step 1 total shipped quantity
     shipped_map = (
-        ship_df.groupby(["Part #", "PO Number"])["Total général"]
-        .sum()
-        .to_dict()
+        ship_df.groupby(["Part #", "Purchasing Document"])["Total général"]
+        .sum().to_dict()
     )
 
-    # ------------------------------------------
-    # FIX APPLIED HERE: qty_to_remove = abs(total_shipped)
-    # ------------------------------------------
+    # STEP1: summary table
+    step1_rows = []
+    for (part, po), qty in shipped_map.items():
+        step1_rows.append({
+            "Material": part,
+            "Purchasing Document": po,
+            "Step1_Downcount": qty
+        })
+    step1_df = pd.DataFrame(step1_rows)
+
+    # Apply Step1 downcount
     for (part, po), total_shipped in shipped_map.items():
-        qty_to_remove = abs(total_shipped)   # <-- FIXED LINE (only change)
+        qty_to_remove = abs(total_shipped)
         if qty_to_remove <= 0:
             continue
 
         mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
+
         for idx in pag_df[mask].index:
             if qty_to_remove <= 0:
                 break
             available = pag_df.at[idx, "Qty remaining to deliver"]
             if pd.notna(available) and available > 0:
                 if available <= qty_to_remove:
-                    pag_df.at[idx, "Qty remaining to deliver"] = 0
                     qty_to_remove -= available
+                    pag_df.at[idx, "Qty remaining to deliver"] = 0
                 else:
                     pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
                     qty_to_remove = 0
 
     # -------------------------------
-    # ROUND 2: EBU DOWNCOUNTING (quantities) + BUILD PRICE LOOKUP
+    # ROUND 2: EBU DOWNCOUNTING & PRICE LOOKUP
     # -------------------------------
     ebu_sheets_all = read_excel(ebu_file.file, sheet_name=None)
     ebu_frames = []
@@ -112,24 +126,28 @@ async def process_files(
         df = read_excel(ebu_file.file, sheet_name=name, header=header_row)
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
-        # For downcounting
+        # EBU quantity
         if {"(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"}.issubset(df.columns):
-            ship_df2 = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
-            ship_df2.rename(columns={"(a)P/N&S/N": "Part #"}, inplace=True)
-            ship_df2["Ship Date"] = pd.to_datetime(ship_df2["Ship Date"], errors="coerce")
-            ship_df2["(f) Qty"] = pd.to_numeric(ship_df2["(f) Qty"], errors="coerce").fillna(0)
-            ebu_frames.append(ship_df2)
+            temp = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
+            temp.rename(columns={"(a)P/N&S/N": "Part #",
+                                 "PO Number": "Purchasing Document"}, inplace=True)
+            temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
+            temp["(f) Qty"] = pd.to_numeric(temp["(f) Qty"], errors="coerce").fillna(0)
+            ebu_frames.append(temp)
 
-        # For price lookup (unit price)
+        # EBU price
         if {"(a)P/N&S/N", "PO Number", "(g) Unit/Lot (Repair) Price"}.issubset(df.columns):
-            price_df = df[["(a)P/N&S/N", "PO Number", "(g) Unit/Lot (Repair) Price"]].copy()
-            price_df.rename(columns={
+            p = df[["(a)P/N&S/N", "PO Number", "(g) Unit/Lot (Repair) Price"]].copy()
+            p.rename(columns={
                 "(a)P/N&S/N": "Material",
                 "PO Number": "Purchasing Document",
                 "(g) Unit/Lot (Repair) Price": "Unit_Price"
             }, inplace=True)
-            price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
-            price_frames.append(price_df)
+            p["Unit_Price"] = pd.to_numeric(p["Unit_Price"], errors="coerce").fillna(0)
+            price_frames.append(p)
+
+    # Step2 downcount summary
+    step2_data = []
 
     ebu_counts = {}
     if ebu_frames:
@@ -138,37 +156,57 @@ async def process_files(
             if pd.notna(cutoff_date):
                 mask = (
                     (ebu_df["Part #"] == part) &
-                    (ebu_df["PO Number"] == po) &
+                    (ebu_df["Purchasing Document"] == po) &
                     (ebu_df["Ship Date"] > cutoff_date)
                 )
-                ebu_counts[(part, po)] = ebu_df.loc[mask, "(f) Qty"].sum()
+                qty = ebu_df.loc[mask, "(f) Qty"].sum()
+                ebu_counts[(part, po)] = qty
+                step2_data.append({
+                    "Material": part,
+                    "Purchasing Document": po,
+                    "Step2_Downcount": qty
+                })
+    else:
+        step2_data = []
 
-        # Apply downcounting from EBU shipments after cutoff
-        for (part, po), qty_to_remove in ebu_counts.items():
+    step2_df = pd.DataFrame(step2_data)
+
+    # Apply Step2 downcounting
+    for (part, po), qty_to_remove in ebu_counts.items():
+        if qty_to_remove <= 0:
+            continue
+        mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
+
+        for idx in pag_df[mask].index:
             if qty_to_remove <= 0:
-                continue
-            mask = (pag_df["Part #"] == part) & (pag_df["Purchasing Document"] == po)
-            for idx in pag_df[mask].index:
-                if qty_to_remove <= 0:
-                    break
-                available = pag_df.at[idx, "Qty remaining to deliver"]
-                if pd.notna(available) and available > 0:
-                    if available <= qty_to_remove:
-                        pag_df.at[idx, "Qty remaining to deliver"] = 0
-                        qty_to_remove -= available
-                    else:
-                        pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
-                        qty_to_remove = 0
+                break
+            available = pag_df.at[idx, "Qty remaining to deliver"]
+            if pd.notna(available) and available > 0:
+                if available <= qty_to_remove:
+                    qty_to_remove -= available
+                    pag_df.at[idx, "Qty remaining to deliver"] = 0
+                else:
+                    pag_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                    qty_to_remove = 0
 
-    # Build Price_Lookup sheet (unique per Material + Purchasing Document)
+    # -------------------------------
+    # LATEST DATES SHEET
+    # -------------------------------
+    latest_rows = []
+    for (part, po), d in ship_latest_dates.items():
+        latest_rows.append({
+            "Material": part,
+            "Purchasing Document": po,
+            "Latest_SlipDate": d
+        })
+    latest_df = pd.DataFrame(latest_rows)
+
+    # -------------------------------
+    # PRICE LOOKUP SHEET
+    # -------------------------------
     if price_frames:
         price_lookup = (
             pd.concat(price_frames, ignore_index=True)
-            .sort_values(["Material", "Purchasing Document"])  
-        )
-        price_lookup = (
-            price_lookup
-            .dropna(subset=["Material", "Purchasing Document"])
             .drop_duplicates(subset=["Material", "Purchasing Document"], keep="last")
             .reset_index(drop=True)
         )
@@ -176,7 +214,7 @@ async def process_files(
         price_lookup = pd.DataFrame(columns=["Material", "Purchasing Document", "Unit_Price"])
 
     # -------------------------------
-    # FINAL FORMATTING
+    # FINAL Updated sheet formatting
     # -------------------------------
     for col in pag_df.columns:
         if "Date" in col:
@@ -185,11 +223,18 @@ async def process_files(
     pag_output = pag_df.rename(columns={"Part #": "Material"}).copy()
 
     # -------------------------------
-    # WRITE UPDATED PAG FILE
+    # WRITE OUTPUT FILE
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # 1️⃣ FIRST SHEET
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
+
+        # 2️⃣ OTHER SHEETS
+        latest_df.to_excel(writer, index=False, sheet_name="Latest_Dates")
+        step1_df.to_excel(writer, index=False, sheet_name="Step1_Downcount")
+        step2_df.to_excel(writer, index=False, sheet_name="Step2_Downcount")
         price_lookup.to_excel(writer, index=False, sheet_name="Price_Lookup")
 
         # Date formatting
@@ -210,7 +255,7 @@ async def process_files(
 
 
 # -------------------------------
-# STEP 2: DELTA + CUMULATIVE + REVENUE ENDPOINT
+# DELTA / CUMULATIVE / REVENUE
 # -------------------------------
 @app.post("/delta")
 async def delta_report(
@@ -221,9 +266,9 @@ async def delta_report(
     old_df = read_excel(old_file.file)
 
     if "Updated" not in new_xl.sheet_names:
-        raise ValueError("The 'new_file' must contain a sheet named 'Updated'.")
+        raise ValueError("Updated sheet missing")
     if "Price_Lookup" not in new_xl.sheet_names:
-        raise ValueError("The 'new_file' must contain a sheet named 'Price_Lookup'.")
+        raise ValueError("Price_Lookup missing")
 
     new_df = new_xl.parse("Updated")
     price_df = new_xl.parse("Price_Lookup")
@@ -236,17 +281,18 @@ async def delta_report(
 
         possible_cols = [c for c in df.columns if "stat" in c.lower() and "del" in c.lower() and "date" in c.lower()]
         if not possible_cols:
-            raise ValueError("Could not find 'Stat.-Rel. Del. Date' column in one of the files.")
+            raise ValueError("Missing Stat.-Rel. Del. Date")
         date_col = possible_cols[0]
 
         df["Stat_Rel_Date"] = pd.to_datetime(df[date_col], errors="coerce")
         df["Month"] = df["Stat_Rel_Date"].dt.to_period("M").astype(str)
 
-    # Group
+    # Grouping
     new_grouped = (
         new_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
         .sum().reset_index().rename(columns={"Qty remaining to deliver": "New_Qty"})
     )
+
     old_grouped = (
         old_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
         .sum().reset_index().rename(columns={"Qty remaining to deliver": "Old_Qty"})
@@ -269,15 +315,16 @@ async def delta_report(
             fill_value=0
         ).reset_index()
     )
+
     pivot.columns.name = None
     sorted_cols = ["Material", "Purchasing Document"] + sorted(
-        [c for c in pivot.columns if c not in ["Material", "Purchasing Document"]]
+        c for c in pivot.columns if c not in ["Material", "Purchasing Document"]
     )
     pivot = pivot[sorted_cols]
 
     # Cumulative
     cumulative = pivot.copy()
-    month_cols = [c for c in cumulative.columns if c not in ["Material", "Purchasing Document"]]
+    month_cols = sorted_cols[2:]
     for i in range(1, len(month_cols)):
         cumulative[month_cols[i]] = cumulative[month_cols[i-1]] + cumulative[month_cols[i]]
 
@@ -285,7 +332,10 @@ async def delta_report(
     price_df.rename(columns=lambda x: str(x).strip(), inplace=True)
     price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
 
-    merged_price = merged.merge(price_df, on=["Material", "Purchasing Document"], how="left").fillna({"Unit_Price": 0})
+    merged_price = merged.merge(
+        price_df, on=["Material", "Purchasing Document"], how="left"
+    ).fillna({"Unit_Price": 0})
+
     merged_price["Revenue"] = merged_price["Delta"] * merged_price["Unit_Price"]
 
     revenue_pivot = (
@@ -297,13 +347,14 @@ async def delta_report(
             fill_value=0
         ).reset_index()
     )
+
     revenue_pivot.columns.name = None
     revenue_sorted_cols = ["Material", "Purchasing Document"] + sorted(
-        [c for c in revenue_pivot.columns if c not in ["Material", "Purchasing Document"]]
+        c for c in revenue_pivot.columns if c not in ["Material", "Purchasing Document"]
     )
     revenue_pivot = revenue_pivot[revenue_sorted_cols]
 
-    # Write output
+    # Write
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pivot.to_excel(writer, index=False, sheet_name="Delta_Report")
