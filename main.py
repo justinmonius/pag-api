@@ -37,11 +37,14 @@ def read_excel(file, **kw):
 def clean_po(po):
     if pd.isna(po):
         return None
+
     po_str = str(po).strip()
 
+    # strip decimals
     if "." in po_str:
         po_str = po_str.split(".")[0]
 
+    # scientific notation
     if "e" in po_str.lower():
         try:
             return int(float(po_str))
@@ -49,6 +52,7 @@ def clean_po(po):
             return None
 
     po_str = po_str.replace(",", "").replace(" ", "")
+
     try:
         return int(po_str)
     except:
@@ -80,7 +84,9 @@ async def process_files(
     # Normalize PO column
     ship_df.rename(columns={"PO Number": "Purchasing Document"}, inplace=True)
 
-    # CLEAN PO NUMBERS TO INTEGERS
+    # ---------------------------------------------------
+    # 🔥 NEW: FORCE PURCHASING DOCUMENT TO NUMERIC
+    # ---------------------------------------------------
     pag_df["Purchasing Document"] = pag_df["Purchasing Document"].apply(clean_po)
     ship_df["Purchasing Document"] = ship_df["Purchasing Document"].apply(clean_po)
 
@@ -151,7 +157,9 @@ async def process_files(
             temp.rename(columns={"(a)P/N&S/N": "Part #",
                                  "PO Number": "Purchasing Document"}, inplace=True)
 
+            ### 🔥 NEW: numeric PO for EBU quantity
             temp["Purchasing Document"] = temp["Purchasing Document"].apply(clean_po)
+
             temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
             temp["(f) Qty"] = pd.to_numeric(temp["(f) Qty"], errors="coerce").fillna(0)
 
@@ -166,7 +174,9 @@ async def process_files(
                 "(g) Unit/Lot (Repair) Price": "Unit_Price"
             }, inplace=True)
 
+            ### 🔥 NEW: numeric PO for EBU prices
             p["Purchasing Document"] = p["Purchasing Document"].apply(clean_po)
+
             p["Unit_Price"] = pd.to_numeric(p["Unit_Price"], errors="coerce").fillna(0)
 
             price_frames.append(p)
@@ -263,6 +273,7 @@ async def process_files(
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
 
+
 # -------------------------------
 # DELTA / CUMULATIVE / REVENUE
 # -------------------------------
@@ -289,6 +300,7 @@ async def delta_report(
         if "Part #" in df.columns:
             df.rename(columns={"Part #": "Material"}, inplace=True)
 
+        ### 🔥 NEW: numeric PO for old and new PAG
         df["Purchasing Document"] = df["Purchasing Document"].apply(clean_po)
 
         possible_cols = [
@@ -343,9 +355,12 @@ async def delta_report(
     for i in range(1, len(month_cols)):
         cumulative[month_cols[i]] = cumulative[month_cols[i-1]] + cumulative[month_cols[i]]
 
-    # Revenue
+    # Revenue Lookup
     price_df.rename(columns=lambda x: str(x).strip(), inplace=True)
+
+    ### 🔥 Numeric PO for price lookup
     price_df["Purchasing Document"] = price_df["Purchasing Document"].apply(clean_po)
+
     price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
 
     merged_price = merged.merge(
@@ -383,6 +398,7 @@ async def delta_report(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=delta_report.xlsx"}
     )
+
 
 @app.get("/")
 def root():
