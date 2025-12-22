@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import pandas as pd
@@ -67,10 +67,11 @@ async def process_files(
     ship_file: UploadFile = File(...),
     ebu_file: UploadFile = File(...)
 ):
-
     pag_df = read_excel(pag_file.file)
-    ship_df = read_excel(ship_file.file, header=1)
 
+    # NOTE: you mentioned your ship test file has headers on row 2 (Excel),
+    # so header=1 is used here.
+    ship_df = read_excel(ship_file.file, header=1)
 
     # Normalize column names
     for df in [pag_df, ship_df]:
@@ -86,7 +87,7 @@ async def process_files(
     ship_df.rename(columns={"PO Number": "Purchasing Document"}, inplace=True)
 
     # ---------------------------------------------------
-    # 🔥 NEW: FORCE PURCHASING DOCUMENT TO NUMERIC
+    # 🔥 FORCE PURCHASING DOCUMENT TO NUMERIC
     # ---------------------------------------------------
     pag_df["Purchasing Document"] = pag_df["Purchasing Document"].apply(clean_po)
     ship_df["Purchasing Document"] = ship_df["Purchasing Document"].apply(clean_po)
@@ -158,7 +159,6 @@ async def process_files(
             temp.rename(columns={"(a)P/N&S/N": "Part #",
                                  "PO Number": "Purchasing Document"}, inplace=True)
 
-            ### 🔥 NEW: numeric PO for EBU quantity
             temp["Purchasing Document"] = temp["Purchasing Document"].apply(clean_po)
 
             temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
@@ -175,9 +175,7 @@ async def process_files(
                 "(g) Unit/Lot (Repair) Price": "Unit_Price"
             }, inplace=True)
 
-            ### 🔥 NEW: numeric PO for EBU prices
             p["Purchasing Document"] = p["Purchasing Document"].apply(clean_po)
-
             p["Unit_Price"] = pd.to_numeric(p["Unit_Price"], errors="coerce").fillna(0)
 
             price_frames.append(p)
@@ -260,7 +258,6 @@ async def process_files(
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
         pag_output.to_excel(writer, index=False, sheet_name="Updated")
         latest_df.to_excel(writer, index=False, sheet_name="Latest_Dates")
         step1_df.to_excel(writer, index=False, sheet_name="Step1_Downcount")
@@ -274,15 +271,19 @@ async def process_files(
         headers={"Content-Disposition": "attachment; filename=updated_pag.xlsx"}
     )
 
-
 # -------------------------------
 # DELTA / CUMULATIVE / REVENUE
+# + ✅ NEW: EBU-only cutoff downcount applied to OLD file before delta calc
 # -------------------------------
 @app.post("/delta")
 async def delta_report(
     new_file: UploadFile = File(...),
-    old_file: UploadFile = File(...)
+    old_file: UploadFile = File(...),
+    ebu_file: UploadFile = File(...),
+    cutoff_date: str = Form(...),
 ):
+    cutoff_dt = pd.to_datetime(cutoff_date, errors="raise")
+
     new_xl = pd.ExcelFile(new_file.file, engine="openpyxl")
     old_df = read_excel(old_file.file)
 
@@ -294,6 +295,79 @@ async def delta_report(
     new_df = new_xl.parse("Updated")
     price_df = new_xl.parse("Price_Lookup")
 
+    # ---------------------------------------------------------
+    # ✅ NEW: Downcount OLD file using ONLY EBU rows after cutoff
+    # (Ship file is NOT used here)
+    # ---------------------------------------------------------
+    old_df.rename(columns=lambda x: str(x).strip(), inplace=True)
+    if "Part #" in old_df.columns:
+        old_df.rename(columns={"Part #": "Material"}, inplace=True)
+    old_df["Purchasing Document"] = old_df["Purchasing Document"].apply(clean_po)
+
+    ebu_sheets_all = read_excel(ebu_file.file, sheet_name=None)
+    ebu_frames = []
+
+    for name in EBU_SHEETS:
+        if name not in ebu_sheets_all:
+            continue
+
+        header_row = 1 if name in SPECIAL_HEADER_SHEETS else 0
+        df = read_excel(ebu_file.file, sheet_name=name, header=header_row)
+        df.rename(columns=lambda x: str(x).strip(), inplace=True)
+
+        if {"(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"}.issubset(df.columns):
+            temp = df[["(a)P/N&S/N", "PO Number", "Ship Date", "(f) Qty"]].copy()
+            temp.rename(columns={
+                "(a)P/N&S/N": "Material",
+                "PO Number": "Purchasing Document"
+            }, inplace=True)
+
+            temp["Purchasing Document"] = temp["Purchasing Document"].apply(clean_po)
+
+            # Ship Date is like "MM/DD/YY" in your EBU; this parses fine:
+            temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
+
+            temp["(f) Qty"] = pd.to_numeric(temp["(f) Qty"], errors="coerce").fillna(0)
+            ebu_frames.append(temp)
+
+    ebu_tx = pd.concat(ebu_frames, ignore_index=True) if ebu_frames else pd.DataFrame(
+        columns=["Material", "Purchasing Document", "Ship Date", "(f) Qty"]
+    )
+
+    # Only after cutoff
+    ebu_tx = ebu_tx[(ebu_tx["Ship Date"].notna()) & (ebu_tx["Ship Date"] > cutoff_dt)]
+
+    # Sum to remove per (Material, PO)
+    ebu_counts = (
+        ebu_tx.groupby(["Material", "Purchasing Document"])["(f) Qty"]
+        .sum()
+        .to_dict()
+    )
+
+    # Apply to OLD file only
+    for (mat, po), qty_to_remove in ebu_counts.items():
+        if qty_to_remove <= 0:
+            continue
+
+        mask = (old_df["Material"] == mat) & (old_df["Purchasing Document"] == po)
+
+        for idx in old_df[mask].index:
+            if qty_to_remove <= 0:
+                break
+
+            available = old_df.at[idx, "Qty remaining to deliver"]
+            if pd.notna(available) and available > 0:
+                if available <= qty_to_remove:
+                    qty_to_remove -= available
+                    old_df.at[idx, "Qty remaining to deliver"] = 0
+                else:
+                    old_df.at[idx, "Qty remaining to deliver"] = available - qty_to_remove
+                    qty_to_remove = 0
+
+    # ---------------------------------------------------------
+    # Existing delta logic (unchanged), now using adjusted old_df
+    # ---------------------------------------------------------
+
     # Normalize
     for df in [new_df, old_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
@@ -301,7 +375,6 @@ async def delta_report(
         if "Part #" in df.columns:
             df.rename(columns={"Part #": "Material"}, inplace=True)
 
-        ### 🔥 NEW: numeric PO for old and new PAG
         df["Purchasing Document"] = df["Purchasing Document"].apply(clean_po)
 
         possible_cols = [
@@ -358,10 +431,7 @@ async def delta_report(
 
     # Revenue Lookup
     price_df.rename(columns=lambda x: str(x).strip(), inplace=True)
-
-    ### 🔥 Numeric PO for price lookup
     price_df["Purchasing Document"] = price_df["Purchasing Document"].apply(clean_po)
-
     price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
 
     merged_price = merged.merge(
@@ -399,7 +469,6 @@ async def delta_report(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=delta_report.xlsx"}
     )
-
 
 @app.get("/")
 def root():
