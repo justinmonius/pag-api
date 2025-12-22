@@ -69,7 +69,8 @@ async def process_files(
 ):
 
     pag_df = read_excel(pag_file.file)
-    ship_df = read_excel(ship_file.file)
+    ship_df = read_excel(ship_file.file, header=1)
+
 
     # Normalize column names
     for df in [pag_df, ship_df]:
