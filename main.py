@@ -60,13 +60,17 @@ def clean_po(po):
 
 # -------------------------------
 # STEP 1: PROCESS ENDPOINT
+# ✅ NEW: cutoff_date used ONLY for (Part, PO) NOT in Ship file, to downcount from EBU after that date
 # -------------------------------
 @app.post("/process")
 async def process_files(
     pag_file: UploadFile = File(...),
     ship_file: UploadFile = File(...),
-    ebu_file: UploadFile = File(...)
+    ebu_file: UploadFile = File(...),
+    cutoff_date: str = Form(None),  # ✅ NEW (YYYY-MM-DD from <input type="date">)
 ):
+    cutoff_dt = pd.to_datetime(cutoff_date, errors="coerce") if cutoff_date else None
+
     pag_df = read_excel(pag_file.file)
 
     # NOTE: you mentioned your ship test file has headers on row 2 (Excel),
@@ -161,6 +165,7 @@ async def process_files(
 
             temp["Purchasing Document"] = temp["Purchasing Document"].apply(clean_po)
 
+            # EBU Ship Date like "MM/DD/YY" parses fine
             temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
             temp["(f) Qty"] = pd.to_numeric(temp["(f) Qty"], errors="coerce").fillna(0)
 
@@ -187,12 +192,13 @@ async def process_files(
     if ebu_frames:
         ebu_df = pd.concat(ebu_frames, ignore_index=True)
 
-        for (part, po), cutoff_date in ship_latest_dates.items():
-            if pd.notna(cutoff_date):
+        # A) Existing behavior: for (Part, PO) found in Ship file, cutoff = latest ship slip date
+        for (part, po), ship_cutoff in ship_latest_dates.items():
+            if pd.notna(ship_cutoff):
                 mask = (
                     (ebu_df["Part #"] == part) &
                     (ebu_df["Purchasing Document"] == po) &
-                    (ebu_df["Ship Date"] > cutoff_date)
+                    (ebu_df["Ship Date"] > ship_cutoff)
                 )
                 qty = ebu_df.loc[mask, "(f) Qty"].sum()
                 ebu_counts[(part, po)] = qty
@@ -203,9 +209,46 @@ async def process_files(
                     "Step2_Downcount": qty
                 })
 
+        # ✅ NEW B) For (Part, PO) present in PAG but NOT in Ship file:
+        # cutoff = user-provided cutoff_date, and downcount EBU rows after that date
+        ship_keys = set(ship_latest_dates.index.tolist())  # {(part, po), ...}
+
+        # build pag keys (exclude nulls)
+        pag_keys = set(
+            (p, po)
+            for p, po in zip(pag_df.get("Part #", pd.Series(dtype=object)), pag_df.get("Purchasing Document", pd.Series(dtype=object)))
+            if pd.notna(p) and pd.notna(po)
+        )
+
+        missing_ship_keys = pag_keys - ship_keys
+
+        if missing_ship_keys and cutoff_dt is None:
+            # user didn't provide a cutoff date but we need one for these keys
+            raise ValueError("cutoff_date is required in Step 1 to downcount EBU for (Part, PO) not present in the shipment/receipt file.")
+
+        if cutoff_dt is not None and missing_ship_keys:
+            for (part, po) in missing_ship_keys:
+                mask = (
+                    (ebu_df["Part #"] == part) &
+                    (ebu_df["Purchasing Document"] == po) &
+                    (ebu_df["Ship Date"] > cutoff_dt)
+                )
+                qty = ebu_df.loc[mask, "(f) Qty"].sum()
+
+                # Only store/apply if there is any qty (keeps Step2_Downcount sheet cleaner)
+                if qty != 0:
+                    # if already has a ship-based entry (unlikely for missing keys), add to it
+                    ebu_counts[(part, po)] = ebu_counts.get((part, po), 0) + qty
+
+                    step2_data.append({
+                        "Material": part,
+                        "Purchasing Document": po,
+                        "Step2_Downcount": qty
+                    })
+
     step2_df = pd.DataFrame(step2_data)
 
-    # APPLY STEP 2 DOWNCOUNT
+    # APPLY STEP 2 DOWNCOUNT (applies both A and B from above via ebu_counts)
     for (part, po), qty_to_remove in ebu_counts.items():
         if qty_to_remove <= 0:
             continue
@@ -273,7 +316,7 @@ async def process_files(
 
 # -------------------------------
 # DELTA / CUMULATIVE / REVENUE
-# + ✅ NEW: EBU-only cutoff downcount applied to OLD file before delta calc
+# + ✅ EBU-only cutoff downcount applied to OLD file before delta calc
 # -------------------------------
 @app.post("/delta")
 async def delta_report(
@@ -296,8 +339,7 @@ async def delta_report(
     price_df = new_xl.parse("Price_Lookup")
 
     # ---------------------------------------------------------
-    # ✅ NEW: Downcount OLD file using ONLY EBU rows after cutoff
-    # (Ship file is NOT used here)
+    # ✅ Downcount OLD file using ONLY EBU rows after cutoff
     # ---------------------------------------------------------
     old_df.rename(columns=lambda x: str(x).strip(), inplace=True)
     if "Part #" in old_df.columns:
@@ -323,10 +365,7 @@ async def delta_report(
             }, inplace=True)
 
             temp["Purchasing Document"] = temp["Purchasing Document"].apply(clean_po)
-
-            # Ship Date is like "MM/DD/YY" in your EBU; this parses fine:
             temp["Ship Date"] = pd.to_datetime(temp["Ship Date"], errors="coerce")
-
             temp["(f) Qty"] = pd.to_numeric(temp["(f) Qty"], errors="coerce").fillna(0)
             ebu_frames.append(temp)
 
@@ -334,17 +373,14 @@ async def delta_report(
         columns=["Material", "Purchasing Document", "Ship Date", "(f) Qty"]
     )
 
-    # Only after cutoff
     ebu_tx = ebu_tx[(ebu_tx["Ship Date"].notna()) & (ebu_tx["Ship Date"] > cutoff_dt)]
 
-    # Sum to remove per (Material, PO)
     ebu_counts = (
         ebu_tx.groupby(["Material", "Purchasing Document"])["(f) Qty"]
         .sum()
         .to_dict()
     )
 
-    # Apply to OLD file only
     for (mat, po), qty_to_remove in ebu_counts.items():
         if qty_to_remove <= 0:
             continue
@@ -367,8 +403,6 @@ async def delta_report(
     # ---------------------------------------------------------
     # Existing delta logic (unchanged), now using adjusted old_df
     # ---------------------------------------------------------
-
-    # Normalize
     for df in [new_df, old_df]:
         df.rename(columns=lambda x: str(x).strip(), inplace=True)
 
@@ -388,7 +422,6 @@ async def delta_report(
         df["Stat_Rel_Date"] = pd.to_datetime(df[date_col], errors="coerce")
         df["Month"] = df["Stat_Rel_Date"].dt.to_period("M").astype(str)
 
-    # Group
     new_grouped = (
         new_df.groupby(["Material", "Purchasing Document", "Month"])["Qty remaining to deliver"]
         .sum().reset_index().rename(columns={"Qty remaining to deliver": "New_Qty"})
@@ -406,7 +439,6 @@ async def delta_report(
 
     merged["Delta"] = merged["New_Qty"] - merged["Old_Qty"]
 
-    # Pivot
     pivot = (
         merged.pivot_table(
             index=["Material", "Purchasing Document"],
@@ -423,13 +455,11 @@ async def delta_report(
     )
     pivot = pivot[sorted_cols]
 
-    # Cumulative
     cumulative = pivot.copy()
     month_cols = sorted_cols[2:]
     for i in range(1, len(month_cols)):
         cumulative[month_cols[i]] = cumulative[month_cols[i-1]] + cumulative[month_cols[i]]
 
-    # Revenue Lookup
     price_df.rename(columns=lambda x: str(x).strip(), inplace=True)
     price_df["Purchasing Document"] = price_df["Purchasing Document"].apply(clean_po)
     price_df["Unit_Price"] = pd.to_numeric(price_df["Unit_Price"], errors="coerce").fillna(0)
@@ -456,7 +486,6 @@ async def delta_report(
     )
     revenue_pivot = revenue_pivot[revenue_sorted_cols]
 
-    # Write output
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pivot.to_excel(writer, index=False, sheet_name="Delta_Report")
