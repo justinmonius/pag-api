@@ -58,6 +58,29 @@ def clean_po(po):
     except:
         return None
 
+# -----------------------------------------------------------
+# ✅ DATE DISPLAY FIX (Excel formatting only)
+# Keeps values as real dates, but displays without "00:00:00"
+# -----------------------------------------------------------
+def apply_date_format_to_sheet(writer, sheet_name: str, df: pd.DataFrame, fmt: str = "mm/dd/yyyy"):
+    ws = writer.sheets.get(sheet_name)
+    if ws is None:
+        return
+
+    # Apply to columns whose header contains "date" (case-insensitive)
+    date_cols = [
+        i for i, col_name in enumerate(df.columns, start=1)
+        if "date" in str(col_name).lower()
+    ]
+    if not date_cols:
+        return
+
+    for col_idx in date_cols:
+        for row in range(2, ws.max_row + 1):  # row 1 is header
+            cell = ws.cell(row=row, column=col_idx)
+            if cell.value is not None:
+                cell.number_format = fmt
+
 # -------------------------------
 # STEP 1: PROCESS ENDPOINT
 # ✅ NEW: cutoff_date used ONLY for (Part, PO) NOT in Ship file, to downcount from EBU after that date
@@ -289,7 +312,7 @@ async def process_files(
     else:
         price_lookup = pd.DataFrame(columns=["Material", "Purchasing Document", "Unit_Price"])
 
-    # Final formatting
+    # Final formatting (keep as real datetimes)
     for col in pag_df.columns:
         if "Date" in col:
             pag_df[col] = pd.to_datetime(pag_df[col], errors="coerce")
@@ -298,6 +321,7 @@ async def process_files(
 
     # -------------------------------
     # WRITE UPDATED PAG FILE
+    # ✅ Date fix applied here (Excel formatting only)
     # -------------------------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -306,6 +330,10 @@ async def process_files(
         step1_df.to_excel(writer, index=False, sheet_name="Step1_Downcount")
         step2_df.to_excel(writer, index=False, sheet_name="Step2_Downcount")
         price_lookup.to_excel(writer, index=False, sheet_name="Price_Lookup")
+
+        # ✅ Remove visible "00:00:00" by formatting date columns in Excel
+        apply_date_format_to_sheet(writer, "Updated", pag_output, fmt="mm/dd/yyyy")
+        apply_date_format_to_sheet(writer, "Latest_Dates", latest_df, fmt="mm/dd/yyyy")
 
     output.seek(0)
     return StreamingResponse(
